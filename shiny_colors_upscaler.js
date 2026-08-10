@@ -13,8 +13,6 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @noframes
-// @downloadURL https://update.greasyfork.org/scripts/590519/%E3%82%B7%E3%83%A3%E3%83%8B%E3%83%9E%E3%82%B9%20Canvas%20%E9%AB%98%E8%A7%A3%E5%83%8F%E5%BA%A6%E5%8C%96%EF%BC%88%E7%B5%B1%E5%90%88%E7%89%88%EF%BC%89.user.js
-// @updateURL https://update.greasyfork.org/scripts/590519/%E3%82%B7%E3%83%A3%E3%83%8B%E3%83%9E%E3%82%B9%20Canvas%20%E9%AB%98%E8%A7%A3%E5%83%8F%E5%BA%A6%E5%8C%96%EF%BC%88%E7%B5%B1%E5%90%88%E7%89%88%EF%BC%89.meta.js
 // ==/UserScript==
 
 // @ts-check
