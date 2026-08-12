@@ -2,7 +2,7 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.1.2
+// @version      2.1.3
 // @description  PIXIの論理座標とCSS表示サイズを維持してCanvasを高解像度化します。Alt+Uで倍率を切り替えられます。
 // @description:en Upscales the Canvas while preserving PIXI logical coordinates and CSS display size. Press Alt+U to change the scale.
 // @license      MIT
