@@ -1,7 +1,9 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const test = require("node:test");
+const vm = require("node:vm");
 
 const {
   applyGameScale,
@@ -139,6 +141,9 @@ function createWindowHarness() {
     },
     countListeners(type) {
       return listeners.get(type)?.length ?? 0;
+    },
+    countIntervals(delay) {
+      return intervals.filter((timer) => timer.delay === delay).length;
     },
   };
 }
@@ -345,6 +350,42 @@ test("appがwindow.ezgをnull化しても捕捉値からシーンを取得でき
   const capturedEzg = { sceneManager: { stage } };
 
   assert.equal(resolveStage(targetWindow, capturedEzg, null), stage);
+});
+
+test("ブラウザ読込時はunsafeWindowを選びruntimeを自動起動する", () => {
+  const pageHarness = createWindowHarness();
+  const managerHarness = createWindowHarness();
+  const menuCommands = [];
+  const source = fs.readFileSync(require.resolve("./shiny_colors_upscaler.js"), "utf8");
+
+  vm.runInNewContext(
+    source,
+    {
+      console,
+      window: managerHarness.targetWindow,
+      unsafeWindow: pageHarness.targetWindow,
+      GM_getValue: (key, fallback) => (key === "canvas-render-scale" ? 2 : fallback),
+      GM_setValue: () => {},
+      GM_registerMenuCommand: (caption, onClick) => menuCommands.push({ caption, onClick }),
+    },
+    { filename: "shiny_colors_upscaler.js" },
+  );
+
+  assert.equal(pageHarness.targetWindow.__shinyColorsUpscaler.mode, 2);
+  assert.equal(typeof pageHarness.targetWindow.__shinyColorsUpscaler.apply, "function");
+  assert.equal(typeof pageHarness.targetWindow.__shinyColorsUpscaler.info, "function");
+  assert.equal(pageHarness.countListeners("resize"), 1);
+  assert.equal(pageHarness.countListeners("orientationchange"), 1);
+  assert.equal(pageHarness.countListeners("keydown"), 1);
+  assert.equal(pageHarness.countIntervals(1000), 1);
+  assert.equal(menuCommands.length, 7);
+  assert.match(menuCommands[0].caption, /Alt\+U/);
+
+  assert.equal(managerHarness.targetWindow.__shinyColorsUpscaler, undefined);
+  assert.equal(managerHarness.countListeners("resize"), 0);
+  assert.equal(managerHarness.countListeners("orientationchange"), 0);
+  assert.equal(managerHarness.countListeners("keydown"), 0);
+  assert.equal(managerHarness.countIntervals(1000), 0);
 });
 
 test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供する", () => {

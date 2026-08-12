@@ -534,7 +534,7 @@
     let capturedEzg = null;
     /** @type {ApplyResult | null} */
     let lastResult = null;
-    // Rendererは画面遷移で再生成されるため、最後に適用した個体を追跡する。
+    // Rendererは画面遷移で再生成されるため、現在監視対象として認識している個体を追跡する。
     /** @type {PixiRenderer | null} */
     let activeRenderer = null;
     /** @type {ResizeObserver | null} */
