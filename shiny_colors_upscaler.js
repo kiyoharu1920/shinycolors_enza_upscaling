@@ -118,10 +118,10 @@
   const MIN_SCALE = MANUAL_SCALES[0];
   const MAX_SCALE = MANUAL_SCALES[MANUAL_SCALES.length - 1];
   /** @type {readonly ScaleMode[]} */
-  const MENU_MODES = ["auto", ...MANUAL_SCALES];
+  const MENU_MODES = Object.freeze(["auto", ...MANUAL_SCALES]);
 
   /**
-   * 保存値を対応倍率へ正規化する。
+   * 倍率一覧を設定の唯一の基準にする。旧版の2.5x/3.5xは同距離なら低い倍率へ移行する。
    * @param {unknown} value
    * @returns {ScaleMode}
    */
@@ -137,7 +137,8 @@
   }
 
   /**
-   * 表示ピクセル密度を満たす自動倍率を計算する。
+   * CSS拡大率と端末DPRの両方を満たす最小の対応倍率を選ぶ。
+   * 選択後にGPU上限を適用するため、結果は一覧外の端数になる場合がある。
    * @param {number} displayWidth CSS表示幅
    * @param {number} displayHeight CSS表示高
    * @param {number} logicalWidth 論理幅
@@ -176,7 +177,7 @@
   }
 
   /**
-   * Alt+Uの初回keydownか判定する。
+   * Apple系キーボードではkeyが"Dead"になる場合があるため、物理キーのcodeも許可する。
    * @param {Pick<KeyboardEvent, "altKey" | "ctrlKey" | "metaKey" | "shiftKey" | "repeat" | "key" | "code">} event
    * @returns {boolean}
    */
@@ -257,7 +258,8 @@
   }
 
   /**
-   * 論理サイズとCSS表示サイズを維持し、PIXI描画解像度を変更する。
+   * Renderer、描画先、入力座標変換を同じ倍率へ更新する。
+   * renderer.resize()はCSSサイズも書き換えるため、呼び出し前の値を必ず復元する。
    * @param {EzgGame | null | undefined} game
    * @param {ScaleMode} mode
    * @param {number} devicePixelRatio
@@ -330,6 +332,7 @@
 
   /**
    * シーン階層内のFilterだけをRenderer倍率へ同期する。
+   * Texture解像度は画像データの解釈を変えるため、描画倍率の対象に含めない。
    * @param {PixiDisplayObject | null | undefined} stage
    * @param {number} scale
    * @returns {number} 更新したFilter数
@@ -377,7 +380,8 @@
   }
 
   /**
-   * 利用可能な保存先から設定を読み、旧スクリプトの設定も引き継ぐ。
+   * GMストレージを優先し、未設定時だけlocalStorageへフォールバックする。
+   * 各保存先では現行キーを旧版キーより優先し、既存利用者の設定を引き継ぐ。
    * @param {ShinyWindow} targetWindow
    * @param {((key: string, defaultValue: unknown) => unknown) | undefined} getValue
    * @returns {ScaleMode}
@@ -451,7 +455,8 @@
   }
 
   /**
-   * ezg公開時の代入を捕捉する。既存プロパティがある場合は監視処理へ任せる。
+   * ezg初回代入を同期的に捕捉する。ゲーム側が直後にwindow.ezgをnull化するため、
+   * setter内で参照を退避してから通常の書き換え可能プロパティへ戻す。
    * @param {ShinyWindow} targetWindow
    * @param {(value: EzgApi) => void} onAssigned
    * @returns {boolean}
@@ -513,19 +518,23 @@
   }
 
   /**
-   * 保存倍率でメニュー登録、Renderer捕捉、再生成・表示サイズ変更監視を開始する。
-   * @returns {void}
+   * 設定、ゲーム参照、監視状態を1つのmoduleへ集約する。
+   * ブラウザ依存は引数から受け取り、起動前でも倍率適用と診断情報を検証できるようにする。
+   * @param {ShinyWindow} targetWindow
+   * @param {UserscriptApi} api
+   * @returns {{
+   *   start: () => void,
+   *   apply: (force?: boolean) => ApplyResult | null,
+   *   info: () => Record<string, unknown>
+   * }}
    */
-  function main() {
-    /** @type {UserscriptApi} */
-    const api = /** @type {UserscriptApi} */ (/** @type {unknown} */ (globalThis));
-    /** @type {ShinyWindow} */
-    const targetWindow = api.unsafeWindow || window;
+  function createUpscalerRuntime(targetWindow, api) {
     let mode = readMode(targetWindow, api.GM_getValue);
     /** @type {EzgApi | null} */
     let capturedEzg = null;
     /** @type {ApplyResult | null} */
     let lastResult = null;
+    // Rendererは画面遷移で再生成されるため、最後に適用した個体を追跡する。
     /** @type {PixiRenderer | null} */
     let activeRenderer = null;
     /** @type {ResizeObserver | null} */
@@ -534,6 +543,7 @@
     /** @type {HTMLDivElement | null} */
     let toastElement = null;
     let toastTimer = 0;
+    let started = false;
 
     /**
      * ホットキー変更結果を画面左下へ短時間表示する。
@@ -593,62 +603,84 @@
       }
     };
 
-    registerScaleMenu(targetWindow, mode, api.GM_setValue, api.GM_registerMenuCommand);
-    installEzgHook(targetWindow, (ezg) => {
-      // appはwindow.ezgを同期的にnull化するため、非同期処理へ入る前に参照を保持する。
-      capturedEzg = ezg;
-      targetWindow.setTimeout(() => {
-        observeCurrentRenderer();
-        apply(true);
-      }, 0);
-    });
-
-    targetWindow.addEventListener("resize", () => targetWindow.setTimeout(() => apply(false), 250));
-    targetWindow.addEventListener("orientationchange", () => targetWindow.setTimeout(() => apply(true), 400));
-    targetWindow.addEventListener(
-      "keydown",
-      (event) => {
-        if (!isUpscalerHotkey(event)) return;
-        event.preventDefault();
-        event.stopPropagation();
-        mode = nextMode(mode);
-        writeMode(targetWindow, mode, api.GM_setValue);
-        const result = apply(true);
-        const label = mode === "auto" ? "自動" : `${mode}x`;
-        const actual = mode === "auto" && result ? ` → ${result.scale}x` : "";
-        showToast(`Canvas描画倍率: ${label}${actual}`);
-      },
-      true,
-    );
-    targetWindow.setInterval(() => {
-      observeCurrentRenderer();
-      apply(false);
-    }, 1000);
-
-    targetWindow.__shinyColorsUpscaler = {
-      get mode() {
-        return mode;
-      },
-      get scale() {
-        return lastResult?.scale ?? null;
-      },
-      apply: () => apply(true),
-      info: () => {
-        const game = resolveGame(targetWindow, capturedEzg);
-        const renderer = game?.renderer;
-        return {
-          mode,
-          scale: lastResult?.scale ?? null,
-          rendererResolution: renderer?.resolution ?? null,
-          logical: game ? [game.width, game.height] : null,
-          backingStore: renderer?.view ? [renderer.view.width, renderer.view.height] : null,
-          cssSize: renderer?.view
-            ? [renderer.view.getBoundingClientRect().width, renderer.view.getBoundingClientRect().height]
-            : null,
-          devicePixelRatio: targetWindow.devicePixelRatio || 1,
-        };
-      },
+    const info = () => {
+      const game = resolveGame(targetWindow, capturedEzg);
+      const renderer = game?.renderer;
+      return {
+        mode,
+        scale: lastResult?.scale ?? null,
+        rendererResolution: renderer?.resolution ?? null,
+        logical: game ? [game.width, game.height] : null,
+        backingStore: renderer?.view ? [renderer.view.width, renderer.view.height] : null,
+        cssSize: renderer?.view
+          ? [renderer.view.getBoundingClientRect().width, renderer.view.getBoundingClientRect().height]
+          : null,
+        devicePixelRatio: targetWindow.devicePixelRatio || 1,
+      };
     };
+
+    const start = () => {
+      // 二重起動はメニュー・監視・ホットキー処理を重複登録するため、同じruntimeでは一度だけ開始する。
+      if (started) return;
+      started = true;
+
+      registerScaleMenu(targetWindow, mode, api.GM_setValue, api.GM_registerMenuCommand);
+      installEzgHook(targetWindow, (ezg) => {
+        // ゲーム側はwindow.ezgを同期的にnull化するため、タイマーへ渡す前に参照を保持する。
+        capturedEzg = ezg;
+        targetWindow.setTimeout(() => {
+          observeCurrentRenderer();
+          apply(true);
+        }, 0);
+      });
+
+      targetWindow.addEventListener("resize", () => targetWindow.setTimeout(() => apply(false), 250));
+      targetWindow.addEventListener("orientationchange", () => targetWindow.setTimeout(() => apply(true), 400));
+      targetWindow.addEventListener(
+        "keydown",
+        (event) => {
+          if (!isUpscalerHotkey(event)) return;
+          event.preventDefault();
+          event.stopPropagation();
+          mode = nextMode(mode);
+          writeMode(targetWindow, mode, api.GM_setValue);
+          const result = apply(true);
+          const label = mode === "auto" ? "自動" : `${mode}x`;
+          const actual = mode === "auto" && result ? ` → ${result.scale}x` : "";
+          showToast(`Canvas描画倍率: ${label}${actual}`);
+        },
+        true,
+      );
+      targetWindow.setInterval(() => {
+        observeCurrentRenderer();
+        apply(false);
+      }, 1000);
+
+      targetWindow.__shinyColorsUpscaler = {
+        get mode() {
+          return mode;
+        },
+        get scale() {
+          return lastResult?.scale ?? null;
+        },
+        apply: () => apply(true),
+        info,
+      };
+    };
+
+    return { apply, info, start };
+  }
+
+  /**
+   * Userscript Managerの実行環境を選び、runtimeを起動する。
+   * @returns {void}
+   */
+  function main() {
+    /** @type {UserscriptApi} */
+    const api = /** @type {UserscriptApi} */ (/** @type {unknown} */ (globalThis));
+    /** @type {ShinyWindow} */
+    const targetWindow = api.unsafeWindow || window;
+    createUpscalerRuntime(targetWindow, api).start();
   }
 
   if (typeof module === "object" && module.exports) {
@@ -657,6 +689,7 @@
       applyRendererScale,
       clampScale,
       computeAutoScale,
+      createUpscalerRuntime,
       getGpuScaleLimit,
       installEzgHook,
       isUpscalerHotkey,

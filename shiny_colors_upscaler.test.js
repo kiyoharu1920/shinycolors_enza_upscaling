@@ -7,6 +7,7 @@ const {
   applyGameScale,
   applyRendererScale,
   computeAutoScale,
+  createUpscalerRuntime,
   getGpuScaleLimit,
   installEzgHook,
   isUpscalerHotkey,
@@ -21,6 +22,7 @@ const {
 function createRenderer(options = {}) {
   const logicalWidth = options.logicalWidth ?? 1136;
   const logicalHeight = options.logicalHeight ?? 640;
+  const viewListeners = new Map();
   const view = {
     width: logicalWidth,
     height: logicalHeight,
@@ -30,6 +32,14 @@ function createRenderer(options = {}) {
       width: options.displayWidth ?? logicalWidth,
       height: options.displayHeight ?? logicalHeight,
     }),
+    addEventListener(type, listener) {
+      const listeners = viewListeners.get(type) ?? [];
+      listeners.push(listener);
+      viewListeners.set(type, listeners);
+    },
+    dispatch(type, event = {}) {
+      for (const listener of viewListeners.get(type) ?? []) listener(event);
+    },
   };
   const renderer = {
     resolution: 1,
@@ -46,6 +56,91 @@ function createRenderer(options = {}) {
     },
   };
   return renderer;
+}
+
+function createWindowHarness() {
+  const listeners = new Map();
+  const timeouts = [];
+  const intervals = [];
+  const resizeObservers = [];
+  const appendedElements = [];
+  let nextTimerId = 1;
+
+  class FakeResizeObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.observed = null;
+      this.disconnected = false;
+      resizeObservers.push(this);
+    }
+
+    observe(target) {
+      this.observed = target;
+    }
+
+    disconnect() {
+      this.disconnected = true;
+    }
+  }
+
+  const targetWindow = {
+    devicePixelRatio: 1,
+    document: {
+      body: {
+        appendChild(element) {
+          appendedElements.push(element);
+        },
+      },
+      createElement: () => ({ style: {}, textContent: "" }),
+    },
+    localStorage: {
+      getItem: () => null,
+      setItem: () => {},
+    },
+    location: { reload: () => {} },
+    ResizeObserver: FakeResizeObserver,
+    addEventListener(type, listener) {
+      const registered = listeners.get(type) ?? [];
+      registered.push(listener);
+      listeners.set(type, registered);
+    },
+    setTimeout(callback, delay) {
+      const id = nextTimerId++;
+      timeouts.push({ id, callback, delay, cancelled: false });
+      return id;
+    },
+    clearTimeout(id) {
+      const timer = timeouts.find((candidate) => candidate.id === id);
+      if (timer) timer.cancelled = true;
+    },
+    setInterval(callback, delay) {
+      const id = nextTimerId++;
+      intervals.push({ id, callback, delay });
+      return id;
+    },
+  };
+
+  return {
+    appendedElements,
+    resizeObservers,
+    targetWindow,
+    dispatch(type, event = {}) {
+      for (const listener of listeners.get(type) ?? []) listener(event);
+    },
+    runIntervals(delay) {
+      for (const timer of intervals.filter((candidate) => candidate.delay === delay)) timer.callback();
+    },
+    runTimeouts(delay) {
+      const pending = timeouts.filter((timer) => !timer.cancelled && timer.delay === delay);
+      for (const timer of pending) {
+        timer.cancelled = true;
+        timer.callback();
+      }
+    },
+    countListeners(type) {
+      return listeners.get(type)?.length ?? 0;
+    },
+  };
 }
 
 test("normalizeModeはautoと対応倍率へ正規化する", () => {
@@ -206,6 +301,11 @@ test("registerScaleMenuはAlt+Uを案内し、案内項目の選択では何も�
   commands[0].onClick();
   assert.deepEqual(storedValues, []);
   assert.equal(reloadCount, 0);
+
+  const scale3Command = commands.find(({ caption }) => caption.includes("3x"));
+  scale3Command.onClick();
+  assert.deepEqual(storedValues, [["canvas-render-scale", 3]]);
+  assert.equal(reloadCount, 1);
 });
 
 test("installEzgHookは最初の代入を通知して通常プロパティへ戻す", () => {
@@ -245,6 +345,121 @@ test("appがwindow.ezgをnull化しても捕捉値からシーンを取得でき
   const capturedEzg = { sceneManager: { stage } };
 
   assert.equal(resolveStage(targetWindow, capturedEzg, null), stage);
+});
+
+test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供する", () => {
+  const harness = createWindowHarness();
+  const renderer = createRenderer();
+  const filter = { resolution: 1 };
+  const stage = { filters: [filter], children: [] };
+  const game = { width: 1136, height: 640, renderer };
+  const menuCommands = [];
+  const runtime = createUpscalerRuntime(harness.targetWindow, {
+    GM_getValue: (key, fallback) => (key === "canvas-render-scale" ? 2 : fallback),
+    GM_setValue: () => {},
+    GM_registerMenuCommand: (caption, onClick) => menuCommands.push({ caption, onClick }),
+  });
+
+  runtime.start();
+  runtime.start();
+  harness.targetWindow.ezg = { game, sceneManager: { stage } };
+  harness.targetWindow.ezg = null;
+  harness.runTimeouts(0);
+
+  assert.equal(menuCommands.length, 7);
+  assert.equal(harness.countListeners("keydown"), 1);
+  assert.equal(renderer.resolution, 2);
+  assert.equal(renderer.rootRenderTarget.resolution, 2);
+  assert.equal(renderer.plugins.interaction.resolution, 2);
+  assert.equal(filter.resolution, 2);
+  assert.equal(harness.resizeObservers.length, 1);
+  assert.equal(harness.resizeObservers[0].observed, renderer.view);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.mode, 2);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.scale, 2);
+  assert.deepEqual(harness.targetWindow.__shinyColorsUpscaler.info(), {
+    mode: 2,
+    scale: 2,
+    rendererResolution: 2,
+    logical: [1136, 640],
+    backingStore: [2272, 1280],
+    cssSize: [1136, 640],
+    devicePixelRatio: 1,
+  });
+
+  renderer.resolution = 1;
+  renderer.rootRenderTarget.resolution = 1;
+  renderer.plugins.interaction.resolution = 1;
+  renderer.view.width = 1136;
+  renderer.view.height = 640;
+  harness.resizeObservers[0].callback();
+  assert.equal(renderer.resolution, 2);
+
+  renderer.resolution = 1;
+  renderer.rootRenderTarget.resolution = 1;
+  renderer.plugins.interaction.resolution = 1;
+  renderer.view.dispatch("webglcontextrestored");
+  assert.equal(renderer.resolution, 2);
+
+  const replacement = createRenderer();
+  game.renderer = replacement;
+  harness.runIntervals(1000);
+  assert.equal(replacement.resolution, 2);
+  assert.equal(harness.resizeObservers.length, 2);
+  assert.equal(harness.resizeObservers[0].disconnected, true);
+  assert.equal(harness.resizeObservers[1].observed, replacement.view);
+});
+
+test("runtimeはAlt+Uと画面変化を同じ倍率適用処理へ集約する", () => {
+  const harness = createWindowHarness();
+  const renderer = createRenderer();
+  const game = { width: 1136, height: 640, renderer };
+  const storedValues = [];
+  harness.targetWindow.ezg = { game };
+  const runtime = createUpscalerRuntime(harness.targetWindow, {
+    GM_getValue: (key, fallback) => (key === "canvas-render-scale" ? 2 : fallback),
+    GM_setValue: (key, value) => storedValues.push([key, value]),
+  });
+
+  runtime.start();
+  harness.targetWindow.ezg = null;
+  harness.runTimeouts(0);
+
+  let preventDefaultCount = 0;
+  let stopPropagationCount = 0;
+  harness.dispatch("keydown", {
+    altKey: true,
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    repeat: false,
+    key: "Dead",
+    code: "KeyU",
+    preventDefault: () => { preventDefaultCount += 1; },
+    stopPropagation: () => { stopPropagationCount += 1; },
+  });
+
+  assert.deepEqual(storedValues, [["canvas-render-scale", 3]]);
+  assert.equal(preventDefaultCount, 1);
+  assert.equal(stopPropagationCount, 1);
+  assert.equal(renderer.resolution, 3);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.mode, 3);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.scale, 3);
+  assert.equal(harness.appendedElements[0].textContent, "Canvas描画倍率: 3x");
+
+  renderer.resolution = 1;
+  renderer.rootRenderTarget.resolution = 1;
+  renderer.plugins.interaction.resolution = 1;
+  renderer.view.width = 1136;
+  renderer.view.height = 640;
+  harness.dispatch("resize");
+  assert.equal(renderer.resolution, 1);
+  harness.runTimeouts(250);
+  assert.equal(renderer.resolution, 3);
+
+  const resizeCalls = renderer.resizeCalls;
+  harness.dispatch("orientationchange");
+  harness.runTimeouts(400);
+  assert.equal(renderer.resizeCalls, resizeCalls + 1);
 });
 
 test("nextModeはauto・1・1.5・2・3・4を巡回する", () => {
