@@ -509,6 +509,45 @@ test("ブラウザ読込時はunsafeWindowを選びruntimeを自動起動する"
   assert.equal(managerHarness.countIntervals(1000), 0);
 });
 
+test("Stayがレキシカルに注入するGM APIで設定メニューを登録する", () => {
+  const pageHarness = createWindowHarness();
+  const managerHarness = createWindowHarness();
+  const menuCommands = [];
+  const storedValues = [];
+  const source = fs.readFileSync(require.resolve("./shiny_colors_upscaler.js"), "utf8");
+  const wrappedSource = `
+    ((injectedApi) => {
+      const unsafeWindow = injectedApi.unsafeWindow;
+      const GM_getValue = injectedApi.GM_getValue;
+      const GM_setValue = injectedApi.GM_setValue;
+      const GM_registerMenuCommand = injectedApi.GM_registerMenuCommand;
+      ${source}
+    })(injectedApi);
+  `;
+
+  vm.runInNewContext(
+    wrappedSource,
+    {
+      console,
+      window: managerHarness.targetWindow,
+      injectedApi: {
+        unsafeWindow: pageHarness.targetWindow,
+        GM_getValue: (key, fallback) => (key === "canvas-render-scale" ? 3 : fallback),
+        GM_setValue: (key, value) => storedValues.push([key, value]),
+        GM_registerMenuCommand: (caption, onClick) => menuCommands.push({ caption, onClick }),
+      },
+    },
+    { filename: "stay-wrapper.js" },
+  );
+
+  assert.equal(pageHarness.targetWindow.__shinyColorsUpscaler.mode, 3);
+  assert.equal(menuCommands.length, 14);
+  assert.match(menuCommands[0].caption, /Alt\+U/);
+  menuCommands.find(({ caption }) => caption.includes("Canvas描画倍率 4x")).onClick();
+  assert.deepEqual(storedValues, [["canvas-render-scale", 4]]);
+  assert.equal(managerHarness.targetWindow.__shinyColorsUpscaler, undefined);
+});
+
 test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供する", () => {
   const harness = createWindowHarness();
   const renderer = createRenderer();

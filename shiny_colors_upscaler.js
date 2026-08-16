@@ -2,7 +2,7 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.3.1
+// @version      2.3.2
 // @description  Canvasを高解像度化し、Spineキャラクターだけをシャープ化します。描画倍率とFilter解像度は個別に変更できます。
 // @description:en Upscales the Canvas and sharpens only Spine characters. Render and filter resolutions can be configured separately.
 // @license      MIT
@@ -916,7 +916,7 @@ void main(void) {
   }
 
   /**
-   * 倍率選択メニューとホットキー案内をTampermonkeyへ登録する。
+   * 倍率選択メニューとホットキー案内をUserscript Managerへ登録する。
    * ホットキー案内は情報表示専用で、選択されても設定を変更しない。
    * @param {ShinyWindow} targetWindow
    * @param {ScaleMode} currentMode
@@ -928,7 +928,7 @@ void main(void) {
     if (typeof registerMenuCommand !== "function") return;
 
     registerMenuCommand(`ホットキー: ${HOTKEY_LABEL}（倍率を順番に切り替え）`, () => {
-      // Tampermonkeyメニューに無効項目はないため、案内専用の空処理とする。
+      // Userscript Managerのメニューに無効項目はないため、案内専用の空処理とする。
     });
 
     for (const mode of MENU_MODES) {
@@ -942,7 +942,7 @@ void main(void) {
   }
 
   /**
-   * Filter解像度選択メニューをTampermonkeyへ登録する。
+   * Filter解像度選択メニューをUserscript Managerへ登録する。
    * @param {ShinyWindow} targetWindow
    * @param {FilterMode} currentMode
    * @param {((key: string, value: unknown) => void) | undefined} setValue
@@ -966,7 +966,7 @@ void main(void) {
   }
 
   /**
-   * Spineシャープ化の現在状態とホットキーをTampermonkeyメニューへ登録する。
+   * Spineシャープ化の現在状態とホットキーをUserscript Managerのメニューへ登録する。
    * @param {ShinyWindow} targetWindow
    * @param {boolean} enabled
    * @param {((key: string, value: unknown) => void) | undefined} setValue
@@ -1363,7 +1363,27 @@ void main(void) {
    */
   function main() {
     /** @type {UserscriptApi} */
-    const api = /** @type {UserscriptApi} */ (/** @type {unknown} */ (globalThis));
+    const globalApi = /** @type {UserscriptApi} */ (/** @type {unknown} */ (globalThis));
+    /** @type {UserscriptApi} */
+    const injectedApi = {};
+    // StayはGM APIとunsafeWindowをglobalThisのプロパティではなく、外側のスコープへ変数として注入する。
+    // @ts-ignore Userscript Managerが実行時に注入する識別子。
+    if (typeof unsafeWindow !== "undefined") injectedApi.unsafeWindow = unsafeWindow;
+    // @ts-ignore Userscript Managerが実行時に注入する識別子。
+    if (typeof GM_getValue !== "undefined") injectedApi.GM_getValue = GM_getValue;
+    // @ts-ignore Userscript Managerが実行時に注入する識別子。
+    if (typeof GM_setValue !== "undefined") injectedApi.GM_setValue = GM_setValue;
+    // @ts-ignore Userscript Managerが実行時に注入する識別子。
+    if (typeof GM_registerMenuCommand !== "undefined") {
+      // @ts-ignore Userscript Managerが実行時に注入する識別子。
+      injectedApi.GM_registerMenuCommand = GM_registerMenuCommand;
+    }
+    const api = {
+      unsafeWindow: injectedApi.unsafeWindow ?? globalApi.unsafeWindow,
+      GM_getValue: injectedApi.GM_getValue ?? globalApi.GM_getValue,
+      GM_setValue: injectedApi.GM_setValue ?? globalApi.GM_setValue,
+      GM_registerMenuCommand: injectedApi.GM_registerMenuCommand ?? globalApi.GM_registerMenuCommand,
+    };
     /** @type {ShinyWindow} */
     const targetWindow = api.unsafeWindow || window;
     createUpscalerRuntime(targetWindow, api).start();

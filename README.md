@@ -10,7 +10,7 @@
 - `Alt + U`で描画倍率を順番に切り替え
 - Spineキャラクターだけへシャープ化Filterを適用
 - `Alt + S`でSpineシャープ化をON/OFF
-- TampermonkeyのメニューからCanvas倍率とFilter解像度を個別に選択
+- TampermonkeyまたはStayのメニューからCanvas倍率とFilter解像度を個別に選択
 - ウィンドウサイズや画面回転の変化を監視して再適用
 - 通常画面だけでなく、Filterを使用する一部画面にも倍率を適用
 - 選択した倍率を保存し、次回起動時にも使用
@@ -27,7 +27,7 @@
 
 ## Filter解像度
 
-Tampermonkeyのメニューから、`Canvas倍率に連動`、`1x`、`1.5x`、`2x`、`3x`、`4x`を選択できます。
+TampermonkeyまたはStayのメニューから、`Canvas倍率に連動`、`1x`、`1.5x`、`2x`、`3x`、`4x`を選択できます。
 
 初期設定は`2x`です。ぼかしなどのFilter処理が重い画面では、Canvasを4xのままFilterだけ1xまたは2xへ下げることでGPU負荷を抑えられます。
 
@@ -37,15 +37,15 @@ Spineシャープ化FilterもこのFilter解像度を使用します。
 
 Spineで描画されるキャラクターにだけ、クランプ付きUnsharp Maskを適用します。文字、通常のUI画像、背景には適用しません。
 
-初期設定は`ON`です。`Alt + S`を押すたびに`ON → OFF → ON`と切り替わり、設定は次回起動時にも引き継がれます。Tampermonkeyメニューからも切り替えられます。
+初期設定は`ON`です。`Alt + S`を押すたびに`ON → OFF → ON`と切り替わり、設定は次回起動時にも引き継がれます。TampermonkeyまたはStayのメニューからも切り替えられます。
 
 ## 使い方
 
-1. Tampermonkeyなどのユーザースクリプトマネージャーへ本スクリプトをインストールします。
+1. TampermonkeyまたはStayへ本スクリプトをインストールします。Stayでは資料庫からスクリプトを有効にし、SafariのStay拡張ポップアップを開きます。
 2. [アイドルマスター シャイニーカラーズ](https://shinycolors.enza.fun/)を開きます。
-3. ゲーム画面で`Alt + U`を押すとCanvas描画倍率、`Alt + S`を押すとSpineシャープ化が切り替わります。Filter解像度はTampermonkeyのメニューから変更します。
+3. ゲーム画面で`Alt + U`を押すとCanvas描画倍率、`Alt + S`を押すとSpineシャープ化が切り替わります。iPhone/iPadではStayの登録メニューから同じ設定を変更できます。
 
-現在のCanvas倍率またはSpineシャープ化状態は画面左下へ短時間表示されます。Tampermonkeyのメニューから設定を選択した場合は、反映のためページが再読み込みされます。
+現在のCanvas倍率またはSpineシャープ化状態は画面左下へ短時間表示されます。Tampermonkey/Stayのメニューから設定を選択した場合は、反映のためページが再読み込みされます。
 
 ## 注意事項
 
