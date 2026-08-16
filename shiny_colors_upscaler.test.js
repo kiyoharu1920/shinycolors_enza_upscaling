@@ -731,11 +731,23 @@ test("setSpineSharpeningは既存Filterを保持してシャープ化だけを�
   assert.equal(sharpenFilter.destroyed, true);
 });
 
+test("setSpineSharpeningはspine.filtersがnullならFilter処理を行わない", () => {
+  const pixi = createPixiHarness();
+  const spine = new pixi.Spine();
+  assert.equal(spine.filters, null);
+
+  assert.equal(setSpineSharpening(spine, pixi, true, 2), false);
+  assert.equal(spine.filters, null);
+  assert.equal(setSpineSharpening(spine, pixi, false, 2), false);
+  assert.equal(spine.filters, null);
+});
+
 test("syncSpineSharpeningはシーン内のSpineだけへ適用する", () => {
   const pixi = createPixiHarness();
   const stage = new pixi.Container();
   const ordinary = new pixi.Container();
   const spine = new pixi.Spine();
+  spine.filters = [];
   stage.children.push(ordinary, spine);
 
   assert.equal(syncSpineSharpening(stage, [pixi], true, 2), 1);
@@ -744,7 +756,7 @@ test("syncSpineSharpeningはシーン内のSpineだけへ適用する", () => {
   assert.equal(spine.filters[0].resolution, 2);
 
   assert.equal(syncSpineSharpening(stage, [pixi], false, 2), 0);
-  assert.equal(spine.filters, null);
+  assert.deepEqual(spine.filters, []);
 });
 
 test("syncSpineSharpeningは別PIXIコピー由来の既存Spineにも互換Filterを適用する", () => {
@@ -752,6 +764,7 @@ test("syncSpineSharpeningは別PIXIコピー由来の既存Spineにも互換Filt
   const otherPixi = createPixiHarness();
   const stage = new otherPixi.Container();
   const spine = new otherPixi.Spine();
+  spine.filters = [];
   stage.children.push(spine);
 
   assert.equal(syncSpineSharpening(stage, [availablePixi], true, 2), 1);
@@ -835,6 +848,7 @@ test("runtimeはAlt+SでSpineシャープ化だけを即時切り替えて保存
   const pixi = createPixiHarness();
   const stage = new pixi.Container();
   const spine = new pixi.Spine();
+  spine.filters = [];
   const renderer = createRenderer();
   const game = { width: 1136, height: 640, renderer, _sceneManager: { stage } };
   const storedValues = [];
@@ -867,7 +881,7 @@ test("runtimeはAlt+SでSpineシャープ化だけを即時切り替えて保存
   };
   harness.dispatch("keydown", event);
 
-  assert.equal(spine.filters, null);
+  assert.deepEqual(spine.filters, []);
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenEnabled, false);
   assert.deepEqual(storedValues.at(-1), ["spine-sharpen-enabled", false]);
   assert.equal(harness.appendedElements.at(-1).textContent, "Spineシャープ化: OFF");

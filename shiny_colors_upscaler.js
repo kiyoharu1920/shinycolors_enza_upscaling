@@ -2,7 +2,7 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.3.0
+// @version      2.3.1
 // @description  Canvasを高解像度化し、Spineキャラクターだけをシャープ化します。描画倍率とFilter解像度は個別に変更できます。
 // @description:en Upscales the Canvas and sharpens only Spine characters. Render and filter resolutions can be configured separately.
 // @license      MIT
@@ -615,13 +615,15 @@ void main(void) {
    */
   function setSpineSharpening(spine, pixi, enabled, resolution, amount = SHARPEN_AMOUNT) {
     if (!isSpineDisplayObject(spine)) return false;
+    // nullはゲーム側がこのSpineでFilter処理を使用していない状態として尊重する。
+    if (spine.filters === null) return false;
 
     const filters = Array.isArray(spine.filters) ? [...spine.filters] : [];
     let sharpenFilter = filters.find(isSpineSharpenFilter);
     if (!enabled) {
       if (sharpenFilter) /** @type {PixiFilter} */ (sharpenFilter).destroy?.();
       const remaining = filters.filter((filter) => filter !== sharpenFilter);
-      spine.filters = remaining.length > 0 ? remaining : null;
+      spine.filters = remaining;
       return false;
     }
     if (!pixi?.Filter) return false;
