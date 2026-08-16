@@ -12,11 +12,17 @@ const {
   createUpscalerRuntime,
   getGpuScaleLimit,
   installEzgHook,
+  isFilterHotkey,
   isUpscalerHotkey,
+  nextFilterMode,
   nextMode,
+  normalizeFilterMode,
   normalizeMode,
+  readFilterMode,
   readMode,
+  registerFilterMenu,
   registerScaleMenu,
+  resolveFilterScale,
   resolveGame,
   resolveStage,
 } = require("./shiny_colors_upscaler.js");
@@ -158,6 +164,19 @@ test("normalizeModeはautoと対応倍率へ正規化する", () => {
   assert.equal(normalizeMode("invalid"), 2);
 });
 
+test("normalizeFilterModeはsyncと対応倍率へ正規化する", () => {
+  assert.equal(normalizeFilterMode("SYNC"), "sync");
+  assert.equal(normalizeFilterMode(2.5), 2);
+  assert.equal(normalizeFilterMode(3.6), 4);
+  assert.equal(normalizeFilterMode("invalid"), "sync");
+});
+
+test("resolveFilterScaleはsyncだけCanvas倍率へ連動する", () => {
+  assert.equal(resolveFilterScale("sync", 4), 4);
+  assert.equal(resolveFilterScale(2, 4), 2);
+  assert.equal(resolveFilterScale(4, 2), 4);
+});
+
 test("computeAutoScaleは表示ピクセル密度を満たす対応倍率へ切り上げる", () => {
   assert.equal(computeAutoScale(1136, 640, 1136, 640, 1, 4), 1);
   assert.equal(computeAutoScale(800, 450, 1136, 640, 2, 4), 1.5);
@@ -241,6 +260,20 @@ test("applyGameScaleは後から追加されたシーンFilterもRenderer倍率�
   assert.equal(laterFilter.resolution, 1);
 });
 
+test("applyGameScaleはCanvasとFilterへ異なる倍率を適用できる", () => {
+  const renderer = createRenderer();
+  const filter = { resolution: 1 };
+  const game = { width: 1136, height: 640, renderer };
+  const stage = { filters: [filter], children: [] };
+
+  const result = applyGameScale(game, stage, 4, 1, false, 2);
+
+  assert.equal(renderer.resolution, 4);
+  assert.equal(filter.resolution, 2);
+  assert.equal(result.scale, 4);
+  assert.equal(result.filterScale, 2);
+});
+
 test("applyRendererScaleは失敗時に元の倍率へ戻す", () => {
   const renderer = createRenderer();
   let shouldThrow = true;
@@ -287,6 +320,16 @@ test("readModeは保存値がなければ既定の2xを返す", () => {
   assert.equal(readMode(targetWindow, (_key, fallback) => fallback), 2);
 });
 
+test("readFilterModeは保存値を読み、未設定時はsyncを返す", () => {
+  const values = new Map([["canvas-filter-scale", "2"]]);
+  const targetWindow = { localStorage: { getItem: (key) => values.get(key) ?? null } };
+
+  assert.equal(readFilterMode(targetWindow, (key, fallback) => (key === "canvas-filter-scale" ? 3 : fallback)), 3);
+  assert.equal(readFilterMode(targetWindow, (_key, fallback) => fallback), 2);
+  values.clear();
+  assert.equal(readFilterMode(targetWindow, (_key, fallback) => fallback), "sync");
+});
+
 test("registerScaleMenuはAlt+Uを案内し、案内項目の選択では何もしない", () => {
   const commands = [];
   const storedValues = [];
@@ -310,6 +353,31 @@ test("registerScaleMenuはAlt+Uを案内し、案内項目の選択では何も�
   const scale3Command = commands.find(({ caption }) => caption.includes("3x"));
   scale3Command.onClick();
   assert.deepEqual(storedValues, [["canvas-render-scale", 3]]);
+  assert.equal(reloadCount, 1);
+});
+
+test("registerFilterMenuはAlt+Yと連動設定を登録する", () => {
+  const commands = [];
+  const storedValues = [];
+  let reloadCount = 0;
+  const targetWindow = {
+    location: { reload: () => { reloadCount += 1; } },
+  };
+
+  registerFilterMenu(
+    targetWindow,
+    "sync",
+    (key, value) => storedValues.push([key, value]),
+    (caption, onClick) => commands.push({ caption, onClick }),
+  );
+
+  assert.match(commands[0].caption, /Alt\+Y/);
+  assert.match(commands[1].caption, /Canvas倍率に連動 ✓/);
+  commands[0].onClick();
+  assert.deepEqual(storedValues, []);
+  const scale2Command = commands.find(({ caption }) => caption.includes("2x"));
+  scale2Command.onClick();
+  assert.deepEqual(storedValues, [["canvas-filter-scale", 2]]);
   assert.equal(reloadCount, 1);
 });
 
@@ -372,14 +440,16 @@ test("ブラウザ読込時はunsafeWindowを選びruntimeを自動起動する"
   );
 
   assert.equal(pageHarness.targetWindow.__shinyColorsUpscaler.mode, 2);
+  assert.equal(pageHarness.targetWindow.__shinyColorsUpscaler.filterMode, "sync");
   assert.equal(typeof pageHarness.targetWindow.__shinyColorsUpscaler.apply, "function");
   assert.equal(typeof pageHarness.targetWindow.__shinyColorsUpscaler.info, "function");
   assert.equal(pageHarness.countListeners("resize"), 1);
   assert.equal(pageHarness.countListeners("orientationchange"), 1);
   assert.equal(pageHarness.countListeners("keydown"), 1);
   assert.equal(pageHarness.countIntervals(1000), 1);
-  assert.equal(menuCommands.length, 7);
+  assert.equal(menuCommands.length, 14);
   assert.match(menuCommands[0].caption, /Alt\+U/);
+  assert.match(menuCommands[7].caption, /Alt\+Y/);
 
   assert.equal(managerHarness.targetWindow.__shinyColorsUpscaler, undefined);
   assert.equal(managerHarness.countListeners("resize"), 0);
@@ -407,7 +477,7 @@ test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供�
   harness.targetWindow.ezg = null;
   harness.runTimeouts(0);
 
-  assert.equal(menuCommands.length, 7);
+  assert.equal(menuCommands.length, 14);
   assert.equal(harness.countListeners("keydown"), 1);
   assert.equal(renderer.resolution, 2);
   assert.equal(renderer.rootRenderTarget.resolution, 2);
@@ -417,9 +487,13 @@ test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供�
   assert.equal(harness.resizeObservers[0].observed, renderer.view);
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.mode, 2);
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.scale, 2);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.filterMode, "sync");
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.filterScale, 2);
   assert.deepEqual(harness.targetWindow.__shinyColorsUpscaler.info(), {
     mode: 2,
     scale: 2,
+    filterMode: "sync",
+    filterScale: 2,
     rendererResolution: 2,
     logical: [1136, 640],
     backingStore: [2272, 1280],
@@ -450,10 +524,16 @@ test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供�
   assert.equal(harness.resizeObservers[1].observed, replacement.view);
 });
 
-test("runtimeはAlt+Uと画面変化を同じ倍率適用処理へ集約する", () => {
+test("runtimeはAlt+U・Alt+Yと画面変化を同じ倍率適用処理へ集約する", () => {
   const harness = createWindowHarness();
   const renderer = createRenderer();
-  const game = { width: 1136, height: 640, renderer };
+  const filter = { resolution: 1 };
+  const game = {
+    width: 1136,
+    height: 640,
+    renderer,
+    _sceneManager: { stage: { filters: [filter], children: [] } },
+  };
   const storedValues = [];
   harness.targetWindow.ezg = { game };
   const runtime = createUpscalerRuntime(harness.targetWindow, {
@@ -485,7 +565,32 @@ test("runtimeはAlt+Uと画面変化を同じ倍率適用処理へ集約する",
   assert.equal(renderer.resolution, 3);
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.mode, 3);
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.scale, 3);
+  assert.equal(filter.resolution, 3);
   assert.equal(harness.appendedElements[0].textContent, "Canvas描画倍率: 3x");
+
+  harness.dispatch("keydown", {
+    altKey: true,
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    repeat: false,
+    key: "Dead",
+    code: "KeyY",
+    preventDefault: () => { preventDefaultCount += 1; },
+    stopPropagation: () => { stopPropagationCount += 1; },
+  });
+
+  assert.deepEqual(storedValues, [
+    ["canvas-render-scale", 3],
+    ["canvas-filter-scale", 1],
+  ]);
+  assert.equal(preventDefaultCount, 2);
+  assert.equal(stopPropagationCount, 2);
+  assert.equal(renderer.resolution, 3);
+  assert.equal(filter.resolution, 1);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.filterMode, 1);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.filterScale, 1);
+  assert.equal(harness.appendedElements[0].textContent, "Filter解像度: 1x");
 
   renderer.resolution = 1;
   renderer.rootRenderTarget.resolution = 1;
@@ -513,6 +618,15 @@ test("nextModeはauto・1・1.5・2・3・4を巡回する", () => {
   assert.equal(nextMode(2.5), 3);
 });
 
+test("nextFilterModeはsync・1・1.5・2・3・4を巡回する", () => {
+  assert.equal(nextFilterMode("sync"), 1);
+  assert.equal(nextFilterMode(1), 1.5);
+  assert.equal(nextFilterMode(1.5), 2);
+  assert.equal(nextFilterMode(2), 3);
+  assert.equal(nextFilterMode(3), 4);
+  assert.equal(nextFilterMode(4), "sync");
+});
+
 test("isUpscalerHotkeyは修飾なしのAlt+Uだけを受け付ける", () => {
   const event = {
     altKey: true,
@@ -529,4 +643,22 @@ test("isUpscalerHotkeyは修飾なしのAlt+Uだけを受け付ける", () => {
   assert.equal(isUpscalerHotkey({ ...event, repeat: true }), false);
   assert.equal(isUpscalerHotkey({ ...event, ctrlKey: true }), false);
   assert.equal(isUpscalerHotkey({ ...event, key: "x", code: "KeyX" }), false);
+});
+
+test("isFilterHotkeyは修飾なしのAlt+Yだけを受け付ける", () => {
+  const event = {
+    altKey: true,
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    repeat: false,
+    key: "y",
+    code: "KeyY",
+  };
+  assert.equal(isFilterHotkey(event), true);
+  assert.equal(isFilterHotkey({ ...event, key: "Y" }), true);
+  assert.equal(isFilterHotkey({ ...event, key: "Dead" }), true);
+  assert.equal(isFilterHotkey({ ...event, repeat: true }), false);
+  assert.equal(isFilterHotkey({ ...event, ctrlKey: true }), false);
+  assert.equal(isFilterHotkey({ ...event, key: "u", code: "KeyU" }), false);
 });
