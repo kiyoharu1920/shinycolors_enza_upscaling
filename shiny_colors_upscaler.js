@@ -2,9 +2,9 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.1.3
-// @description  PIXIの論理座標とCSS表示サイズを維持してCanvasを高解像度化します。Alt+Uで倍率を切り替えられます。
-// @description:en Upscales the Canvas while preserving PIXI logical coordinates and CSS display size. Press Alt+U to change the scale.
+// @version      2.2.1
+// @description  PIXIの論理座標とCSS表示サイズを維持してCanvasを高解像度化します。Filter解像度はメニューから個別に変更できます。
+// @description:en Upscales the Canvas while preserving PIXI logical coordinates and CSS display size. Filter resolution can be configured separately from the menu.
 // @license      MIT
 // @match        https://shinycolors.enza.fun/*
 // @run-at       document-start
@@ -21,6 +21,7 @@
   "use strict";
 
   /** @typedef {"auto" | number} ScaleMode */
+  /** @typedef {"sync" | number} FilterMode */
 
   /**
    * このスクリプトが利用するPIXI DisplayObjectの最小構造。
@@ -93,6 +94,8 @@
    * @typedef {object} DiagnosticApi
    * @property {ScaleMode} mode
    * @property {number | null} scale
+   * @property {FilterMode} filterMode
+   * @property {number | null} filterScale
    * @property {() => ApplyResult | null} apply
    * @property {() => Record<string, unknown>} info
    */
@@ -104,21 +107,29 @@
    * @property {number} scale
    * @property {[number, number]} logical
    * @property {[number, number]} backingStore
+   * @property {number=} filterScale
    */
 
   const LOG_PREFIX = "[shiny-colors-upscaler]";
   const STORAGE_KEY = "canvas-render-scale";
+  const FILTER_STORAGE_KEY = "canvas-filter-scale";
   const LEGACY_GM_KEY = "scale";
   const LEGACY_LOCAL_STORAGE_KEY = "enzaUpscaler.mode";
   const HOTKEY_LABEL = "Alt+U";
+  // Filter解像度のホットキー切り替えは無効化中。
+  // const FILTER_HOTKEY_LABEL = "Alt+Y";
   /** @type {ScaleMode} */
   const DEFAULT_MODE = 2;
+  /** @type {FilterMode} */
+  const DEFAULT_FILTER_MODE = 2;
   /** @type {readonly number[]} */
   const MANUAL_SCALES = Object.freeze([1, 1.5, 2, 3, 4]);
   const MIN_SCALE = MANUAL_SCALES[0];
   const MAX_SCALE = MANUAL_SCALES[MANUAL_SCALES.length - 1];
   /** @type {readonly ScaleMode[]} */
   const MENU_MODES = Object.freeze(["auto", ...MANUAL_SCALES]);
+  /** @type {readonly FilterMode[]} */
+  const FILTER_MENU_MODES = Object.freeze(["sync", ...MANUAL_SCALES]);
 
   /**
    * 倍率一覧を設定の唯一の基準にする。旧版の2.5x/3.5xは同距離なら低い倍率へ移行する。
@@ -130,6 +141,22 @@
 
     const parsed = Number(value);
     if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MODE;
+
+    return MANUAL_SCALES.reduce((nearest, candidate) =>
+      Math.abs(candidate - parsed) < Math.abs(nearest - parsed) ? candidate : nearest,
+    );
+  }
+
+  /**
+   * Filter設定を描画倍率への連動または対応倍率へ正規化する。
+   * @param {unknown} value
+   * @returns {FilterMode}
+   */
+  function normalizeFilterMode(value) {
+    if (typeof value === "string" && value.trim().toLowerCase() === "sync") return "sync";
+
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_FILTER_MODE;
 
     return MANUAL_SCALES.reduce((nearest, candidate) =>
       Math.abs(candidate - parsed) < Math.abs(nearest - parsed) ? candidate : nearest,
@@ -176,6 +203,23 @@
     return MENU_MODES[(currentIndex + 1) % MENU_MODES.length];
   }
 
+  // Filter解像度のホットキー切り替えは無効化中。
+  // function nextFilterMode(currentMode) {
+  //   const normalized = normalizeFilterMode(currentMode);
+  //   const currentIndex = FILTER_MENU_MODES.findIndex((candidate) => candidate === normalized);
+  //   return FILTER_MENU_MODES[(currentIndex + 1) % FILTER_MENU_MODES.length];
+  // }
+
+  /**
+   * 連動モードでは実際のCanvas倍率、それ以外では選択したFilter倍率を返す。
+   * @param {FilterMode} filterMode
+   * @param {number} renderScale
+   * @returns {number}
+   */
+  function resolveFilterScale(filterMode, renderScale) {
+    return filterMode === "sync" ? renderScale : filterMode;
+  }
+
   /**
    * Apple系キーボードではkeyが"Dead"になる場合があるため、物理キーのcodeも許可する。
    * @param {Pick<KeyboardEvent, "altKey" | "ctrlKey" | "metaKey" | "shiftKey" | "repeat" | "key" | "code">} event
@@ -191,6 +235,18 @@
       (event.code === "KeyU" || event.key.toLowerCase() === "u")
     );
   }
+
+  // Filter解像度のホットキー切り替えは無効化中。
+  // function isFilterHotkey(event) {
+  //   return (
+  //     event.altKey &&
+  //     !event.ctrlKey &&
+  //     !event.metaKey &&
+  //     !event.shiftKey &&
+  //     !event.repeat &&
+  //     (event.code === "KeyY" || event.key.toLowerCase() === "y")
+  //   );
+  // }
 
   /**
    * 指定倍率をスクリプト上限とGPU上限へ収める。
@@ -369,14 +425,16 @@
    * @param {ScaleMode} mode
    * @param {number} devicePixelRatio
    * @param {boolean=} force
+   * @param {FilterMode=} filterMode
    * @returns {ApplyResult | null}
    */
-  function applyGameScale(game, stage, mode, devicePixelRatio, force = false) {
+  function applyGameScale(game, stage, mode, devicePixelRatio, force = false, filterMode = DEFAULT_FILTER_MODE) {
     const result = applyRendererScale(game, mode, devicePixelRatio, force);
     if (!result) return null;
 
-    syncFilterResolutions(stage, result.scale);
-    return result;
+    const filterScale = resolveFilterScale(filterMode, result.scale);
+    syncFilterResolutions(stage, filterScale);
+    return { ...result, filterScale };
   }
 
   /**
@@ -410,6 +468,29 @@
   }
 
   /**
+   * Filter解像度設定を読む。未設定時はCanvas倍率への連動を使う。
+   * @param {ShinyWindow} targetWindow
+   * @param {((key: string, defaultValue: unknown) => unknown) | undefined} getValue
+   * @returns {FilterMode}
+   */
+  function readFilterMode(targetWindow, getValue) {
+    const missing = `__missing_${Date.now()}_${Math.random()}__`;
+    if (typeof getValue === "function") {
+      const current = getValue(FILTER_STORAGE_KEY, missing);
+      if (current !== missing) return normalizeFilterMode(current);
+    }
+
+    try {
+      const currentLocal = targetWindow.localStorage?.getItem(FILTER_STORAGE_KEY);
+      if (currentLocal !== null && currentLocal !== undefined) return normalizeFilterMode(currentLocal);
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} Filter設定を読めませんでした。`, error);
+    }
+
+    return DEFAULT_FILTER_MODE;
+  }
+
+  /**
    * 設定を保存する。
    * @param {ShinyWindow} targetWindow
    * @param {ScaleMode} mode
@@ -425,6 +506,25 @@
       targetWindow.localStorage?.setItem(STORAGE_KEY, String(mode));
     } catch (error) {
       console.warn(`${LOG_PREFIX} localStorage設定を保存できませんでした。`, error);
+    }
+  }
+
+  /**
+   * Filter解像度設定を保存する。
+   * @param {ShinyWindow} targetWindow
+   * @param {FilterMode} mode
+   * @param {((key: string, value: unknown) => void) | undefined} setValue
+   * @returns {void}
+   */
+  function writeFilterMode(targetWindow, mode, setValue) {
+    if (typeof setValue === "function") {
+      setValue(FILTER_STORAGE_KEY, mode);
+      return;
+    }
+    try {
+      targetWindow.localStorage?.setItem(FILTER_STORAGE_KEY, String(mode));
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} Filter設定を保存できませんでした。`, error);
     }
   }
 
@@ -449,6 +549,30 @@
       const label = mode === "auto" ? "自動" : `${mode}x`;
       registerMenuCommand(`Canvas描画倍率 ${label}${selected}`, () => {
         writeMode(targetWindow, mode, setValue);
+        targetWindow.location.reload();
+      });
+    }
+  }
+
+  /**
+   * Filter解像度選択メニューをTampermonkeyへ登録する。
+   * @param {ShinyWindow} targetWindow
+   * @param {FilterMode} currentMode
+   * @param {((key: string, value: unknown) => void) | undefined} setValue
+   * @param {((caption: string, onClick: () => void) => unknown) | undefined} registerMenuCommand
+   * @returns {void}
+   */
+  function registerFilterMenu(targetWindow, currentMode, setValue, registerMenuCommand) {
+    if (typeof registerMenuCommand !== "function") return;
+
+    // Filter解像度のホットキー切り替えは無効化中。
+    // registerMenuCommand(`ホットキー: ${FILTER_HOTKEY_LABEL}（Filter解像度を順番に切り替え）`, () => {});
+
+    for (const mode of FILTER_MENU_MODES) {
+      const selected = mode === currentMode ? " ✓" : "";
+      const label = mode === "sync" ? "Canvas倍率に連動" : `${mode}x`;
+      registerMenuCommand(`Filter解像度 ${label}${selected}`, () => {
+        writeFilterMode(targetWindow, mode, setValue);
         targetWindow.location.reload();
       });
     }
@@ -530,6 +654,7 @@
    */
   function createUpscalerRuntime(targetWindow, api) {
     let mode = readMode(targetWindow, api.GM_getValue);
+    let filterMode = readFilterMode(targetWindow, api.GM_getValue);
     /** @type {EzgApi | null} */
     let capturedEzg = null;
     /** @type {ApplyResult | null} */
@@ -578,6 +703,7 @@
         mode,
         targetWindow.devicePixelRatio || 1,
         force,
+        filterMode,
       );
       return lastResult;
     };
@@ -609,6 +735,8 @@
       return {
         mode,
         scale: lastResult?.scale ?? null,
+        filterMode,
+        filterScale: lastResult?.filterScale ?? null,
         rendererResolution: renderer?.resolution ?? null,
         logical: game ? [game.width, game.height] : null,
         backingStore: renderer?.view ? [renderer.view.width, renderer.view.height] : null,
@@ -625,6 +753,7 @@
       started = true;
 
       registerScaleMenu(targetWindow, mode, api.GM_setValue, api.GM_registerMenuCommand);
+      registerFilterMenu(targetWindow, filterMode, api.GM_setValue, api.GM_registerMenuCommand);
       installEzgHook(targetWindow, (ezg) => {
         // ゲーム側はwindow.ezgを同期的にnull化するため、タイマーへ渡す前に参照を保持する。
         capturedEzg = ezg;
@@ -639,7 +768,10 @@
       targetWindow.addEventListener(
         "keydown",
         (event) => {
-          if (!isUpscalerHotkey(event)) return;
+          const changesRenderScale = isUpscalerHotkey(event);
+          // Filter解像度のホットキー切り替えは無効化中。
+          // const changesFilterScale = isFilterHotkey(event);
+          if (!changesRenderScale) return;
           event.preventDefault();
           event.stopPropagation();
           mode = nextMode(mode);
@@ -648,6 +780,13 @@
           const label = mode === "auto" ? "自動" : `${mode}x`;
           const actual = mode === "auto" && result ? ` → ${result.scale}x` : "";
           showToast(`Canvas描画倍率: ${label}${actual}`);
+
+          // Filter解像度のホットキー切り替えは無効化中。
+          // filterMode = nextFilterMode(filterMode);
+          // writeFilterMode(targetWindow, filterMode, api.GM_setValue);
+          // const filterResult = apply(false);
+          // const filterLabel = filterMode === "sync" ? "Canvas倍率に連動" : `${filterMode}x`;
+          // showToast(`Filter解像度: ${filterLabel} → ${filterResult?.filterScale ?? "-"}x`);
         },
         true,
       );
@@ -662,6 +801,12 @@
         },
         get scale() {
           return lastResult?.scale ?? null;
+        },
+        get filterMode() {
+          return filterMode;
+        },
+        get filterScale() {
+          return lastResult?.filterScale ?? null;
         },
         apply: () => apply(true),
         info,
@@ -691,12 +836,18 @@
       computeAutoScale,
       createUpscalerRuntime,
       getGpuScaleLimit,
+      // isFilterHotkey,
       installEzgHook,
       isUpscalerHotkey,
+      // nextFilterMode,
       nextMode,
+      normalizeFilterMode,
       normalizeMode,
+      readFilterMode,
       readMode,
+      registerFilterMenu,
       registerScaleMenu,
+      resolveFilterScale,
       resolveGame,
       resolveScale,
       resolveStage,
