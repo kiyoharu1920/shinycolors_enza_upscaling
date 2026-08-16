@@ -9,9 +9,13 @@ const {
   applyGameScale,
   applyRendererScale,
   computeAutoScale,
+  createSpineSharpenFilter,
   createUpscalerRuntime,
   getGpuScaleLimit,
   installEzgHook,
+  installPixiHook,
+  installSpineAddChildHook,
+  isSharpenHotkey,
   isUpscalerHotkey,
   nextMode,
   normalizeFilterMode,
@@ -20,10 +24,61 @@ const {
   readMode,
   registerFilterMenu,
   registerScaleMenu,
+  registerSharpenMenu,
   resolveFilterScale,
   resolveGame,
   resolveStage,
+  setSpineSharpening,
+  syncSpineSharpening,
 } = require("./shiny_colors_upscaler.js");
+
+function createPixiHarness() {
+  class Container {
+    constructor() {
+      this.children = [];
+      this.filters = null;
+    }
+
+    addChild(...children) {
+      this.children.push(...children);
+      return children[0];
+    }
+
+    addChildAt(child, index) {
+      this.children.splice(index, 0, child);
+      return child;
+    }
+  }
+
+  class Filter {
+    constructor(vertexSrc, fragmentSrc, uniforms) {
+      this.vertexSrc = vertexSrc;
+      this.fragmentSrc = fragmentSrc;
+      this.uniformData = uniforms;
+      this.uniforms = Object.fromEntries(
+        Object.entries(uniforms).map(([name, definition]) => [name, definition?.value]),
+      );
+      this.resolution = 1;
+      this.padding = 0;
+      this.autoFit = false;
+      this.destroyed = false;
+    }
+
+    destroy() {
+      this.destroyed = true;
+    }
+  }
+
+  class Spine extends Container {
+    constructor() {
+      super();
+      this.skeleton = {};
+      this.slotContainers = [];
+    }
+  }
+
+  return { Container, Filter, Spine };
+}
 
 function createRenderer(options = {}) {
   const logicalWidth = options.logicalWidth ?? 1136;
@@ -443,7 +498,7 @@ test("ブラウザ読込時はunsafeWindowを選びruntimeを自動起動する"
   assert.equal(pageHarness.countListeners("orientationchange"), 1);
   assert.equal(pageHarness.countListeners("keydown"), 1);
   assert.equal(pageHarness.countIntervals(1000), 1);
-  assert.equal(menuCommands.length, 13);
+  assert.equal(menuCommands.length, 14);
   assert.match(menuCommands[0].caption, /Alt\+U/);
   assert.match(menuCommands[7].caption, /Canvas倍率に連動/);
 
@@ -473,7 +528,7 @@ test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供�
   harness.targetWindow.ezg = null;
   harness.runTimeouts(0);
 
-  assert.equal(menuCommands.length, 13);
+  assert.equal(menuCommands.length, 14);
   assert.equal(harness.countListeners("keydown"), 1);
   assert.equal(renderer.resolution, 2);
   assert.equal(renderer.rootRenderTarget.resolution, 2);
@@ -490,6 +545,8 @@ test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供�
     scale: 2,
     filterMode: 2,
     filterScale: 2,
+    sharpenEnabled: true,
+    sharpenedSpines: 0,
     rendererResolution: 2,
     logical: [1136, 640],
     backingStore: [2272, 1280],
@@ -606,4 +663,203 @@ test("isUpscalerHotkeyは修飾なしのAlt+Uだけを受け付ける", () => {
   assert.equal(isUpscalerHotkey({ ...event, repeat: true }), false);
   assert.equal(isUpscalerHotkey({ ...event, ctrlKey: true }), false);
   assert.equal(isUpscalerHotkey({ ...event, key: "x", code: "KeyX" }), false);
+});
+
+test("isSharpenHotkeyは修飾なしのAlt+Sだけを受け付ける", () => {
+  const event = {
+    altKey: true,
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    repeat: false,
+    key: "s",
+    code: "KeyS",
+  };
+
+  assert.equal(isSharpenHotkey(event), true);
+  assert.equal(isSharpenHotkey({ ...event, key: "S" }), true);
+  assert.equal(isSharpenHotkey({ ...event, key: "Dead" }), true);
+  assert.equal(isSharpenHotkey({ ...event, repeat: true }), false);
+  assert.equal(isSharpenHotkey({ ...event, ctrlKey: true }), false);
+  assert.equal(isSharpenHotkey({ ...event, key: "u", code: "KeyU" }), false);
+});
+
+test("createSpineSharpenFilterは入力RenderTargetの実ピクセル幅からサンプル間隔を更新する", () => {
+  const pixi = createPixiHarness();
+  const filter = createSpineSharpenFilter(pixi, 0.7, 4);
+  let applied = null;
+
+  filter.apply(
+    {
+      applyFilter(...args) {
+        applied = args;
+      },
+    },
+    { size: { width: 100, height: 50 }, resolution: 2 },
+    { name: "output" },
+    false,
+  );
+
+  assert.match(filter.fragmentSrc, /clamp/);
+  assert.equal(filter.uniforms.sharpness, 0.7);
+  assert.deepEqual(Array.from(filter.uniforms.texelSize), [1 / 200, 1 / 100]);
+  assert.equal(filter.resolution, 4);
+  assert.equal(filter.padding, 1);
+  assert.equal(filter.autoFit, true);
+  assert.equal(applied[0], filter);
+});
+
+test("setSpineSharpeningは既存Filterを保持してシャープ化だけを着脱する", () => {
+  const pixi = createPixiHarness();
+  const existingFilter = { resolution: 1 };
+  const spine = new pixi.Spine();
+  spine.filters = [existingFilter];
+
+  assert.equal(setSpineSharpening(spine, pixi, true, 3), true);
+  assert.equal(spine.filters.length, 2);
+  assert.equal(spine.filters[0], existingFilter);
+  const sharpenFilter = spine.filters[1];
+  assert.equal(sharpenFilter.resolution, 3);
+
+  assert.equal(setSpineSharpening(spine, pixi, true, 4), true);
+  assert.equal(spine.filters.length, 2);
+  assert.equal(spine.filters[1], sharpenFilter);
+  assert.equal(sharpenFilter.resolution, 4);
+
+  assert.equal(setSpineSharpening(spine, pixi, false, 4), false);
+  assert.deepEqual(spine.filters, [existingFilter]);
+  assert.equal(sharpenFilter.destroyed, true);
+});
+
+test("syncSpineSharpeningはシーン内のSpineだけへ適用する", () => {
+  const pixi = createPixiHarness();
+  const stage = new pixi.Container();
+  const ordinary = new pixi.Container();
+  const spine = new pixi.Spine();
+  stage.children.push(ordinary, spine);
+
+  assert.equal(syncSpineSharpening(stage, [pixi], true, 2), 1);
+  assert.equal(ordinary.filters, null);
+  assert.equal(spine.filters.length, 1);
+  assert.equal(spine.filters[0].resolution, 2);
+
+  assert.equal(syncSpineSharpening(stage, [pixi], false, 2), 0);
+  assert.equal(spine.filters, null);
+});
+
+test("syncSpineSharpeningは別PIXIコピー由来の既存Spineにも互換Filterを適用する", () => {
+  const availablePixi = createPixiHarness();
+  const otherPixi = createPixiHarness();
+  const stage = new otherPixi.Container();
+  const spine = new otherPixi.Spine();
+  stage.children.push(spine);
+
+  assert.equal(syncSpineSharpening(stage, [availablePixi], true, 2), 1);
+  assert.equal(spine.filters.length, 1);
+  assert.equal(spine.filters[0].resolution, 2);
+});
+
+test("installSpineAddChildHookは後から追加されたSpineを検出する", () => {
+  const pixi = createPixiHarness();
+  const found = [];
+  assert.equal(installSpineAddChildHook(pixi, (spine) => found.push(spine)), true);
+
+  const parent = new pixi.Container();
+  const spine = new pixi.Spine();
+  parent.addChild(spine);
+
+  assert.deepEqual(found, [spine]);
+});
+
+test("installPixiHookは既存descriptorを保持して後続PIXI代入を通知する", () => {
+  let storedPixi = null;
+  const previousAssignments = [];
+  const targetWindow = {};
+  Object.defineProperty(targetWindow, "PIXI", {
+    configurable: true,
+    get: () => storedPixi,
+    set(value) {
+      storedPixi = value;
+      previousAssignments.push(value);
+    },
+  });
+  const assigned = [];
+
+  assert.equal(installPixiHook(targetWindow, (pixi) => assigned.push(pixi)), true);
+  const pixi = createPixiHarness();
+  targetWindow.PIXI = pixi;
+
+  assert.equal(targetWindow.PIXI, pixi);
+  assert.deepEqual(previousAssignments, [pixi]);
+  assert.deepEqual(assigned, [pixi]);
+});
+
+test("registerSharpenMenuはAlt+Sを案内して設定を反転する", () => {
+  const commands = [];
+  const storedValues = [];
+  let reloadCount = 0;
+  const targetWindow = { location: { reload: () => { reloadCount += 1; } } };
+
+  registerSharpenMenu(
+    targetWindow,
+    true,
+    (key, value) => storedValues.push([key, value]),
+    (caption, onClick) => commands.push({ caption, onClick }),
+  );
+
+  assert.equal(commands.length, 1);
+  assert.match(commands[0].caption, /Alt\+S/);
+  assert.match(commands[0].caption, /ON/);
+  commands[0].onClick();
+  assert.deepEqual(storedValues, [["spine-sharpen-enabled", false]]);
+  assert.equal(reloadCount, 1);
+});
+
+test("runtimeはAlt+SでSpineシャープ化だけを即時切り替えて保存する", () => {
+  const harness = createWindowHarness();
+  const pixi = createPixiHarness();
+  const stage = new pixi.Container();
+  const spine = new pixi.Spine();
+  const renderer = createRenderer();
+  const game = { width: 1136, height: 640, renderer, _sceneManager: { stage } };
+  const storedValues = [];
+  const runtime = createUpscalerRuntime(harness.targetWindow, {
+    GM_getValue: (_key, fallback) => fallback,
+    GM_setValue: (key, value) => storedValues.push([key, value]),
+  });
+
+  runtime.start();
+  harness.targetWindow.PIXI = pixi;
+  stage.addChild(spine);
+  harness.targetWindow.ezg = { game };
+  harness.targetWindow.ezg = null;
+  harness.runTimeouts(0);
+
+  assert.equal(spine.filters.length, 1);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenEnabled, true);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.info().sharpenedSpines, 1);
+
+  const event = {
+    altKey: true,
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    repeat: false,
+    key: "Dead",
+    code: "KeyS",
+    preventDefault: () => {},
+    stopPropagation: () => {},
+  };
+  harness.dispatch("keydown", event);
+
+  assert.equal(spine.filters, null);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenEnabled, false);
+  assert.deepEqual(storedValues.at(-1), ["spine-sharpen-enabled", false]);
+  assert.equal(harness.appendedElements.at(-1).textContent, "Spineシャープ化: OFF");
+
+  harness.dispatch("keydown", event);
+  assert.equal(spine.filters.length, 1);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenEnabled, true);
+  assert.deepEqual(storedValues.at(-1), ["spine-sharpen-enabled", true]);
+  assert.equal(harness.appendedElements.at(-1).textContent, "Spineシャープ化: ON");
 });

@@ -2,9 +2,9 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.2.1
-// @description  PIXIの論理座標とCSS表示サイズを維持してCanvasを高解像度化します。Filter解像度はメニューから個別に変更できます。
-// @description:en Upscales the Canvas while preserving PIXI logical coordinates and CSS display size. Filter resolution can be configured separately from the menu.
+// @version      2.3.0
+// @description  Canvasを高解像度化し、Spineキャラクターだけをシャープ化します。描画倍率とFilter解像度は個別に変更できます。
+// @description:en Upscales the Canvas and sharpens only Spine characters. Render and filter resolutions can be configured separately.
 // @license      MIT
 // @match        https://shinycolors.enza.fun/*
 // @run-at       document-start
@@ -24,10 +24,50 @@
   /** @typedef {"sync" | number} FilterMode */
 
   /**
+   * PIXI Filterのうち本スクリプトが利用する最小構造。
+   * @typedef {object} PixiFilter
+   * @property {number} resolution
+   * @property {number} padding
+   * @property {boolean} autoFit
+   * @property {Record<string, unknown>} uniforms
+   * @property {(filterManager: PixiFilterManager, input: PixiRenderTarget, output: unknown, clear: boolean) => void} apply
+   * @property {(() => void)=} destroy
+   */
+
+  /**
+   * PIXI FilterManagerの最小構造。
+   * @typedef {object} PixiFilterManager
+   * @property {(filter: PixiFilter, input: PixiRenderTarget, output: unknown, clear: boolean) => void} applyFilter
+   */
+
+  /**
+   * Filter入力RenderTargetの最小構造。
+   * @typedef {object} PixiRenderTarget
+   * @property {{ width: number, height: number }} size
+   * @property {number=} resolution
+   */
+
+  /**
+   * PIXI Containerプロトタイプの最小構造。
+   * @typedef {object} PixiContainerPrototype
+   * @property {(...children: PixiDisplayObject[]) => PixiDisplayObject=} addChild
+   * @property {(child: PixiDisplayObject, index: number) => PixiDisplayObject=} addChildAt
+   */
+
+  /**
+   * 本スクリプトが利用するPIXI名前空間の最小構造。
+   * @typedef {object} PixiNamespace
+   * @property {{ prototype: PixiContainerPrototype }} Container
+   * @property {new (vertexSrc?: string, fragmentSrc?: string, uniforms?: Record<string, unknown>) => PixiFilter} Filter
+   */
+
+  /**
    * このスクリプトが利用するPIXI DisplayObjectの最小構造。
    * @typedef {object} PixiDisplayObject
    * @property {ResolutionTarget[] | null=} filters
    * @property {PixiDisplayObject[] | null=} children
+   * @property {object=} skeleton
+   * @property {PixiDisplayObject[]=} slotContainers
    */
 
   /**
@@ -78,7 +118,7 @@
    */
 
   /** @typedef {{ game?: EzgGame, sceneManager?: { stage?: PixiDisplayObject } }} EzgApi */
-  /** @typedef {Window & typeof globalThis & { ezg?: EzgApi, __shinyColorsUpscaler?: DiagnosticApi }} ShinyWindow */
+  /** @typedef {Window & typeof globalThis & { ezg?: EzgApi, PIXI?: PixiNamespace, __shinyColorsUpscaler?: DiagnosticApi }} ShinyWindow */
 
   /**
    * Userscript Managerが公開するAPI。
@@ -96,6 +136,7 @@
    * @property {number | null} scale
    * @property {FilterMode} filterMode
    * @property {number | null} filterScale
+   * @property {boolean} sharpenEnabled
    * @property {() => ApplyResult | null} apply
    * @property {() => DiagnosticInfo} info
    */
@@ -117,6 +158,8 @@
    * @property {number | null} scale
    * @property {FilterMode} filterMode
    * @property {number | null} filterScale
+   * @property {boolean} sharpenEnabled
+   * @property {number} sharpenedSpines
    * @property {number | null} rendererResolution
    * @property {[number, number] | null} logical
    * @property {[number, number] | null} backingStore
@@ -138,18 +181,53 @@
   const STORAGE_KEY = "canvas-render-scale";
   /** Filter解像度を保存する現行キー。 @type {string} */
   const FILTER_STORAGE_KEY = "canvas-filter-scale";
+  /** Spineシャープ化の有効状態を保存するキー。 @type {string} */
+  const SHARPEN_STORAGE_KEY = "spine-sharpen-enabled";
   /** 旧版のGMストレージからCanvas倍率を移行するキー。 @type {string} */
   const LEGACY_GM_KEY = "scale";
   /** 旧版のlocalStorageからCanvas倍率を移行するキー。 @type {string} */
   const LEGACY_LOCAL_STORAGE_KEY = "enzaUpscaler.mode";
   /** Canvas描画倍率を切り替えるホットキー表示名。 @type {string} */
   const HOTKEY_LABEL = "Alt+U";
+  /** Spineシャープ化を切り替えるホットキー表示名。 @type {string} */
+  const SHARPEN_HOTKEY_LABEL = "Alt+S";
   // Filter解像度のホットキー切り替えは無効化中。
   // const FILTER_HOTKEY_LABEL = "Alt+Y";
   /** Canvas描画倍率の既定値。 @type {ScaleMode} */
   const DEFAULT_MODE = 2;
   /** Filter解像度の既定値。 @type {FilterMode} */
   const DEFAULT_FILTER_MODE = 2;
+  /** Spineシャープ化の既定状態。 @type {boolean} */
+  const DEFAULT_SHARPEN_ENABLED = true;
+  /** Spineシャープ化の強度。 @type {number} */
+  const SHARPEN_AMOUNT = 0.7;
+  /** 本スクリプトが生成したFilterを識別するプロパティ。 @type {string} */
+  const SHARPEN_FILTER_TAG = "__shinyColorsSpineSharpenFilter";
+  /** PIXI ContainerプロトタイプごとのSpine追加監視。 @type {WeakMap<object, Set<(spine: PixiDisplayObject) => void>>} */
+  const SPINE_ADD_HOOKS = new WeakMap();
+  /** Spineの輪郭だけを補正するクランプ付きUnsharp Mask。 @type {string} */
+  const SPINE_SHARPEN_FRAGMENT_SHADER = `
+varying vec2 vTextureCoord;
+uniform sampler2D uSampler;
+uniform vec4 filterClamp;
+uniform vec2 texelSize;
+uniform float sharpness;
+
+vec4 sampleClamped(vec2 offset) {
+  return texture2D(uSampler, clamp(vTextureCoord + offset, filterClamp.xy, filterClamp.zw));
+}
+
+void main(void) {
+  vec4 center = sampleClamped(vec2(0.0));
+  vec3 surrounding = (
+    sampleClamped(vec2(texelSize.x, 0.0)).rgb +
+    sampleClamped(vec2(-texelSize.x, 0.0)).rgb +
+    sampleClamped(vec2(0.0, texelSize.y)).rgb +
+    sampleClamped(vec2(0.0, -texelSize.y)).rgb
+  ) * 0.25;
+  vec3 sharpened = center.rgb + sharpness * (center.rgb - surrounding);
+  gl_FragColor = vec4(clamp(sharpened, vec3(0.0), vec3(center.a)), center.a);
+}`;
   /** 手動選択できる共通倍率一覧。 @type {readonly number[]} */
   const MANUAL_SCALES = Object.freeze([1, 1.5, 2, 3, 4]);
   /** 手動倍率一覧の最小値。 @type {number} */
@@ -263,6 +341,38 @@
       !event.shiftKey &&
       !event.repeat &&
       (event.code === "KeyU" || event.key.toLowerCase() === "u")
+    );
+  }
+
+  /**
+   * 保存値をSpineシャープ化の有効状態へ正規化する。
+   * @param {unknown} value
+   * @returns {boolean}
+   */
+  function normalizeSharpenEnabled(value) {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (["false", "0", "off"].includes(normalized)) return false;
+      if (["true", "1", "on"].includes(normalized)) return true;
+    }
+    return DEFAULT_SHARPEN_ENABLED;
+  }
+
+  /**
+   * Apple系キーボードではkeyが"Dead"になる場合があるため、物理キーのcodeも許可する。
+   * @param {Pick<KeyboardEvent, "altKey" | "ctrlKey" | "metaKey" | "shiftKey" | "repeat" | "key" | "code">} event
+   * @returns {boolean}
+   */
+  function isSharpenHotkey(event) {
+    return (
+      event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.shiftKey &&
+      !event.repeat &&
+      (event.code === "KeyS" || event.key.toLowerCase() === "s")
     );
   }
 
@@ -449,6 +559,210 @@
   }
 
   /**
+   * Spineシャープ化Filterを生成する。Filter入力の物理解像度から1pxのサンプル間隔を毎回更新する。
+   * @param {PixiNamespace} pixi
+   * @param {number} amount
+   * @param {number} resolution
+   * @returns {PixiFilter}
+   */
+  function createSpineSharpenFilter(pixi, amount = SHARPEN_AMOUNT, resolution = 2) {
+    const filter = new pixi.Filter(undefined, SPINE_SHARPEN_FRAGMENT_SHADER, {
+      sharpness: { type: "1f", value: amount },
+      texelSize: { type: "v2", value: [1, 1] },
+    });
+    filter.resolution = resolution;
+    filter.padding = 1;
+    filter.autoFit = true;
+    Object.defineProperty(filter, SHARPEN_FILTER_TAG, { value: true });
+    filter.apply = (filterManager, input, output, clear) => {
+      const inputResolution = Number(input.resolution) > 0 ? Number(input.resolution) : filter.resolution;
+      const physicalWidth = Math.max(1, Number(input.size.width) * inputResolution);
+      const physicalHeight = Math.max(1, Number(input.size.height) * inputResolution);
+      const texelSize = /** @type {number[]} */ (filter.uniforms.texelSize);
+      texelSize[0] = 1 / physicalWidth;
+      texelSize[1] = 1 / physicalHeight;
+      filterManager.applyFilter(filter, input, output, clear);
+    };
+    return filter;
+  }
+
+  /**
+   * DisplayObjectがSpine本体かを、プラグイン版に依存しない実体構造で判定する。
+   * @param {PixiDisplayObject | null | undefined} node
+   * @returns {boolean}
+   */
+  function isSpineDisplayObject(node) {
+    return Boolean(node?.skeleton && Array.isArray(node.slotContainers));
+  }
+
+  /**
+   * Filterが本スクリプトのSpineシャープ化Filterかを判定する。
+   * @param {ResolutionTarget | null | undefined} filter
+   * @returns {boolean}
+   */
+  function isSpineSharpenFilter(filter) {
+    return Boolean(filter && /** @type {Record<string, unknown>} */ (filter)[SHARPEN_FILTER_TAG]);
+  }
+
+  /**
+   * Spineへシャープ化Filterだけを着脱し、ゲーム側の既存Filterは保持する。
+   * @param {PixiDisplayObject} spine
+   * @param {PixiNamespace | null | undefined} pixi
+   * @param {boolean} enabled
+   * @param {number} resolution
+   * @param {number=} amount
+   * @returns {boolean} 適用後にシャープ化が有効か
+   */
+  function setSpineSharpening(spine, pixi, enabled, resolution, amount = SHARPEN_AMOUNT) {
+    if (!isSpineDisplayObject(spine)) return false;
+
+    const filters = Array.isArray(spine.filters) ? [...spine.filters] : [];
+    let sharpenFilter = filters.find(isSpineSharpenFilter);
+    if (!enabled) {
+      if (sharpenFilter) /** @type {PixiFilter} */ (sharpenFilter).destroy?.();
+      const remaining = filters.filter((filter) => filter !== sharpenFilter);
+      spine.filters = remaining.length > 0 ? remaining : null;
+      return false;
+    }
+    if (!pixi?.Filter) return false;
+
+    if (!sharpenFilter) {
+      sharpenFilter = createSpineSharpenFilter(pixi, amount, resolution);
+      filters.push(sharpenFilter);
+      spine.filters = filters;
+    } else {
+      sharpenFilter.resolution = resolution;
+      /** @type {PixiFilter} */ (sharpenFilter).uniforms.sharpness = amount;
+    }
+    return true;
+  }
+
+  /**
+   * DisplayObjectを生成したPIXIコピーをプロトタイプから特定する。
+   * @param {Iterable<PixiNamespace>} pixiCopies
+   * @param {PixiDisplayObject} node
+   * @returns {PixiNamespace | null}
+   */
+  function findPixiForDisplayObject(pixiCopies, node) {
+    let compatibleFallback = null;
+    for (const pixi of pixiCopies) {
+      if (!compatibleFallback && typeof pixi.Filter === "function") compatibleFallback = pixi;
+      if (pixi.Container?.prototype && Object.prototype.isPrototypeOf.call(pixi.Container.prototype, node)) return pixi;
+    }
+    // enza-gameとpixi-aeは別のPIXIコピーだが、同じFilter契約を利用する。
+    // document-start後に残ったコピーしか参照できない場合も、互換Filterで既存Spineへ適用する。
+    return compatibleFallback;
+  }
+
+  /**
+   * シーン内のSpineだけへ現在のシャープ化状態を同期する。
+   * @param {PixiDisplayObject | null | undefined} stage
+   * @param {Iterable<PixiNamespace>} pixiCopies
+   * @param {boolean} enabled
+   * @param {number} resolution
+   * @returns {number} シャープ化が有効なSpine数
+   */
+  function syncSpineSharpening(stage, pixiCopies, enabled, resolution) {
+    if (!stage || !Number.isFinite(resolution) || resolution <= 0) return 0;
+
+    const pending = [stage];
+    const visited = new Set();
+    let sharpened = 0;
+    while (pending.length > 0) {
+      const node = pending.pop();
+      if (!node || visited.has(node)) continue;
+      visited.add(node);
+
+      if (isSpineDisplayObject(node)) {
+        const pixi = findPixiForDisplayObject(pixiCopies, node);
+        if (setSpineSharpening(node, pixi, enabled, resolution)) sharpened += 1;
+      }
+      if (Array.isArray(node.children)) pending.push(...node.children);
+    }
+    return sharpened;
+  }
+
+  /**
+   * シーン内で本スクリプトのFilterが有効なSpine数を数える。
+   * @param {PixiDisplayObject | null | undefined} stage
+   * @returns {number}
+   */
+  function countSharpenedSpines(stage) {
+    if (!stage) return 0;
+    const pending = [stage];
+    const visited = new Set();
+    let count = 0;
+    while (pending.length > 0) {
+      const node = pending.pop();
+      if (!node || visited.has(node)) continue;
+      visited.add(node);
+      if (isSpineDisplayObject(node) && Array.isArray(node.filters) && node.filters.some(isSpineSharpenFilter)) {
+        count += 1;
+      }
+      if (Array.isArray(node.children)) pending.push(...node.children);
+    }
+    return count;
+  }
+
+  /**
+   * Containerへ後から追加されるSpineを検出する。複数runtimeでも元メソッドは一度だけラップする。
+   * @param {PixiNamespace} pixi
+   * @param {(spine: PixiDisplayObject) => void} onSpine
+   * @returns {boolean}
+   */
+  function installSpineAddChildHook(pixi, onSpine) {
+    const prototype = pixi?.Container?.prototype;
+    if (!prototype) return false;
+
+    const existingListeners = SPINE_ADD_HOOKS.get(/** @type {object} */ (prototype));
+    if (existingListeners) {
+      existingListeners.add(onSpine);
+      return true;
+    }
+
+    const listeners = new Set([onSpine]);
+    SPINE_ADD_HOOKS.set(/** @type {object} */ (prototype), listeners);
+    /** @param {PixiDisplayObject} root */
+    const notifyTree = (root) => {
+      const pending = [root];
+      const visited = new Set();
+      while (pending.length > 0) {
+        const node = pending.pop();
+        if (!node || visited.has(node)) continue;
+        visited.add(node);
+        if (isSpineDisplayObject(node)) {
+          for (const listener of listeners) {
+            try {
+              listener(node);
+            } catch (error) {
+              console.warn(`${LOG_PREFIX} Spineシャープ化の適用に失敗しました。`, error);
+            }
+          }
+        }
+        if (Array.isArray(node.children)) pending.push(...node.children);
+      }
+    };
+
+    if (typeof prototype.addChild === "function") {
+      const originalAddChild = prototype.addChild;
+      prototype.addChild = function (...children) {
+        const result = originalAddChild.apply(this, children);
+        children.forEach(notifyTree);
+        return result;
+      };
+    }
+    if (typeof prototype.addChildAt === "function") {
+      const originalAddChildAt = prototype.addChildAt;
+      prototype.addChildAt = function (child, index) {
+        const result = originalAddChildAt.call(this, child, index);
+        notifyTree(child);
+        return result;
+      };
+    }
+    return true;
+  }
+
+  /**
    * Rendererと現在のシーンFilterへ同じ倍率を適用する。
    * @param {EzgGame | null | undefined} game
    * @param {PixiDisplayObject | null | undefined} stage
@@ -521,6 +835,28 @@
   }
 
   /**
+   * Spineシャープ化設定を読む。未設定時は有効にする。
+   * @param {ShinyWindow} targetWindow
+   * @param {((key: string, defaultValue: unknown) => unknown) | undefined} getValue
+   * @returns {boolean}
+   */
+  function readSharpenEnabled(targetWindow, getValue) {
+    const missing = `__missing_${Date.now()}_${Math.random()}__`;
+    if (typeof getValue === "function") {
+      const current = getValue(SHARPEN_STORAGE_KEY, missing);
+      if (current !== missing) return normalizeSharpenEnabled(current);
+    }
+
+    try {
+      const currentLocal = targetWindow.localStorage?.getItem(SHARPEN_STORAGE_KEY);
+      if (currentLocal !== null && currentLocal !== undefined) return normalizeSharpenEnabled(currentLocal);
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} Spineシャープ化設定を読めませんでした。`, error);
+    }
+    return DEFAULT_SHARPEN_ENABLED;
+  }
+
+  /**
    * 設定を保存する。
    * @param {ShinyWindow} targetWindow
    * @param {ScaleMode} mode
@@ -555,6 +891,25 @@
       targetWindow.localStorage?.setItem(FILTER_STORAGE_KEY, String(mode));
     } catch (error) {
       console.warn(`${LOG_PREFIX} Filter設定を保存できませんでした。`, error);
+    }
+  }
+
+  /**
+   * Spineシャープ化設定を保存する。
+   * @param {ShinyWindow} targetWindow
+   * @param {boolean} enabled
+   * @param {((key: string, value: unknown) => void) | undefined} setValue
+   * @returns {void}
+   */
+  function writeSharpenEnabled(targetWindow, enabled, setValue) {
+    if (typeof setValue === "function") {
+      setValue(SHARPEN_STORAGE_KEY, enabled);
+      return;
+    }
+    try {
+      targetWindow.localStorage?.setItem(SHARPEN_STORAGE_KEY, String(enabled));
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} Spineシャープ化設定を保存できませんでした。`, error);
     }
   }
 
@@ -605,6 +960,62 @@
         writeFilterMode(targetWindow, mode, setValue);
         targetWindow.location.reload();
       });
+    }
+  }
+
+  /**
+   * Spineシャープ化の現在状態とホットキーをTampermonkeyメニューへ登録する。
+   * @param {ShinyWindow} targetWindow
+   * @param {boolean} enabled
+   * @param {((key: string, value: unknown) => void) | undefined} setValue
+   * @param {((caption: string, onClick: () => void) => unknown) | undefined} registerMenuCommand
+   * @returns {void}
+   */
+  function registerSharpenMenu(targetWindow, enabled, setValue, registerMenuCommand) {
+    if (typeof registerMenuCommand !== "function") return;
+    const label = enabled ? "ON ✓" : "OFF";
+    registerMenuCommand(`Spineシャープ化 ${label}（${SHARPEN_HOTKEY_LABEL}で切り替え）`, () => {
+      writeSharpenEnabled(targetWindow, !enabled, setValue);
+      targetWindow.location.reload();
+    });
+  }
+
+  /**
+   * window.PIXIへの全代入を、既存descriptorを壊さず捕捉する。
+   * @param {ShinyWindow} targetWindow
+   * @param {(pixi: PixiNamespace) => void} onAssigned
+   * @returns {boolean}
+   */
+  function installPixiHook(targetWindow, onAssigned) {
+    const descriptor = Object.getOwnPropertyDescriptor(targetWindow, "PIXI");
+    if (descriptor && !descriptor.configurable) {
+      if (targetWindow.PIXI) onAssigned(targetWindow.PIXI);
+      return false;
+    }
+
+    const previousGet = descriptor?.get;
+    const previousSet = descriptor?.set;
+    let currentValue = descriptor && "value" in descriptor ? descriptor.value : targetWindow.PIXI;
+    if (currentValue) onAssigned(currentValue);
+
+    try {
+      Object.defineProperty(targetWindow, "PIXI", {
+        configurable: true,
+        enumerable: descriptor?.enumerable ?? true,
+        get() {
+          return previousGet ? previousGet.call(targetWindow) : currentValue;
+        },
+        set(value) {
+          if (previousSet) previousSet.call(targetWindow, value);
+          else currentValue = value;
+          const assigned = previousGet ? previousGet.call(targetWindow) : value;
+          if (assigned) onAssigned(assigned);
+        },
+      });
+      return true;
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} PIXIフックを設定できませんでした。`, error);
+      return false;
     }
   }
 
@@ -683,6 +1094,8 @@
     let mode = readMode(targetWindow, api.GM_getValue);
     /** 現在選択されているFilter解像度。 @type {FilterMode} */
     let filterMode = readFilterMode(targetWindow, api.GM_getValue);
+    /** Spineシャープ化の現在状態。 @type {boolean} */
+    let sharpenEnabled = readSharpenEnabled(targetWindow, api.GM_getValue);
     /** window.ezgがnull化される前に保持した参照。 @type {EzgApi | null} */
     let capturedEzg = null;
     /** 最後に成功した倍率適用結果。 @type {ApplyResult | null} */
@@ -699,6 +1112,58 @@
     let toastTimer = 0;
     /** 同じruntimeの二重起動を防止するフラグ。 @type {boolean} */
     let started = false;
+    /** ページ内で代入されたPIXIコピー。 @type {Set<PixiNamespace>} */
+    const pixiCopies = new Set();
+
+    /**
+     * Spine Filterへ適用する現在の解像度を返す。
+     * @returns {number}
+     */
+    const getSharpenResolution = () => {
+      if (lastResult?.filterScale) return lastResult.filterScale;
+      if (filterMode !== "sync") return filterMode;
+      return lastResult?.scale ?? Number(DEFAULT_MODE);
+    };
+
+    /**
+     * 現在のシーンへSpineシャープ化状態を同期する。
+     * @returns {number}
+     */
+    const applySpineSharpening = () => {
+      const game = resolveGame(targetWindow, capturedEzg);
+      return syncSpineSharpening(
+        resolveStage(targetWindow, capturedEzg, game),
+        pixiCopies,
+        sharpenEnabled,
+        getSharpenResolution(),
+      );
+    };
+
+    /**
+     * 後から追加されたSpineへ現在設定を即時適用する。
+     * @param {PixiDisplayObject} spine
+     * @returns {void}
+     */
+    const onSpineAdded = (spine) => {
+      setSpineSharpening(
+        spine,
+        findPixiForDisplayObject(pixiCopies, spine),
+        sharpenEnabled,
+        getSharpenResolution(),
+      );
+    };
+
+    /**
+     * 新しく公開されたPIXIコピーへSpine追加監視を設定する。
+     * @param {PixiNamespace} pixi
+     * @returns {void}
+     */
+    const onPixiAssigned = (pixi) => {
+      if (!pixi?.Container?.prototype || typeof pixi.Filter !== "function") return;
+      pixiCopies.add(pixi);
+      installSpineAddChildHook(pixi, onSpineAdded);
+      applySpineSharpening();
+    };
 
     /**
      * ホットキー変更結果を画面左下へ短時間表示する。
@@ -732,14 +1197,18 @@
       const game = resolveGame(targetWindow, capturedEzg);
       if (!game?.renderer) return null;
       activeRenderer = game.renderer;
+      const stage = resolveStage(targetWindow, capturedEzg, game);
       lastResult = applyGameScale(
         game,
-        resolveStage(targetWindow, capturedEzg, game),
+        stage,
         mode,
         targetWindow.devicePixelRatio || 1,
         force,
         filterMode,
       );
+      if (lastResult) {
+        syncSpineSharpening(stage, pixiCopies, sharpenEnabled, lastResult.filterScale ?? lastResult.scale);
+      }
       return lastResult;
     };
 
@@ -780,6 +1249,8 @@
         scale: lastResult?.scale ?? null,
         filterMode,
         filterScale: lastResult?.filterScale ?? null,
+        sharpenEnabled,
+        sharpenedSpines: countSharpenedSpines(resolveStage(targetWindow, capturedEzg, game)),
         rendererResolution: renderer?.resolution ?? null,
         logical: game ? [game.width, game.height] : null,
         backingStore: renderer?.view ? [renderer.view.width, renderer.view.height] : null,
@@ -801,6 +1272,8 @@
 
       registerScaleMenu(targetWindow, mode, api.GM_setValue, api.GM_registerMenuCommand);
       registerFilterMenu(targetWindow, filterMode, api.GM_setValue, api.GM_registerMenuCommand);
+      registerSharpenMenu(targetWindow, sharpenEnabled, api.GM_setValue, api.GM_registerMenuCommand);
+      installPixiHook(targetWindow, onPixiAssigned);
       installEzgHook(targetWindow, (ezg) => {
         // ゲーム側はwindow.ezgを同期的にnull化するため、タイマーへ渡す前に参照を保持する。
         capturedEzg = ezg;
@@ -816,11 +1289,19 @@
         "keydown",
         (event) => {
           const changesRenderScale = isUpscalerHotkey(event);
+          const changesSharpen = isSharpenHotkey(event);
           // Filter解像度のホットキー切り替えは無効化中。
           // const changesFilterScale = isFilterHotkey(event);
-          if (!changesRenderScale) return;
+          if (!changesRenderScale && !changesSharpen) return;
           event.preventDefault();
           event.stopPropagation();
+          if (changesSharpen) {
+            sharpenEnabled = !sharpenEnabled;
+            writeSharpenEnabled(targetWindow, sharpenEnabled, api.GM_setValue);
+            applySpineSharpening();
+            showToast(`Spineシャープ化: ${sharpenEnabled ? "ON" : "OFF"}`);
+            return;
+          }
           mode = nextMode(mode);
           writeMode(targetWindow, mode, api.GM_setValue);
           const result = apply(true);
@@ -855,6 +1336,9 @@
         get filterScale() {
           return lastResult?.filterScale ?? null;
         },
+        get sharpenEnabled() {
+          return sharpenEnabled;
+        },
         apply: () => apply(true),
         info,
       };
@@ -881,24 +1365,33 @@
       applyRendererScale,
       clampScale,
       computeAutoScale,
+      createSpineSharpenFilter,
       createUpscalerRuntime,
       getGpuScaleLimit,
       // isFilterHotkey,
       installEzgHook,
+      installPixiHook,
+      installSpineAddChildHook,
+      isSharpenHotkey,
       isUpscalerHotkey,
       // nextFilterMode,
       nextMode,
       normalizeFilterMode,
       normalizeMode,
+      normalizeSharpenEnabled,
       readFilterMode,
       readMode,
+      readSharpenEnabled,
       registerFilterMenu,
       registerScaleMenu,
+      registerSharpenMenu,
       resolveFilterScale,
       resolveGame,
       resolveScale,
       resolveStage,
+      setSpineSharpening,
       syncFilterResolutions,
+      syncSpineSharpening,
     };
     return;
   }
