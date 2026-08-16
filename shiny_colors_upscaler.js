@@ -987,16 +987,24 @@ void main(void) {
    * @returns {boolean}
    */
   function installPixiHook(targetWindow, onAssigned) {
+    /** @param {PixiNamespace} pixi */
+    const safeNotify = (pixi) => {
+      try {
+        onAssigned(pixi);
+      } catch (error) {
+        console.warn(`${LOG_PREFIX} PIXI代入通知を処理できませんでした。`, error);
+      }
+    };
     const descriptor = Object.getOwnPropertyDescriptor(targetWindow, "PIXI");
     if (descriptor && !descriptor.configurable) {
-      if (targetWindow.PIXI) onAssigned(targetWindow.PIXI);
+      if (targetWindow.PIXI) safeNotify(targetWindow.PIXI);
       return false;
     }
 
     const previousGet = descriptor?.get;
     const previousSet = descriptor?.set;
     let currentValue = descriptor && "value" in descriptor ? descriptor.value : targetWindow.PIXI;
-    if (currentValue) onAssigned(currentValue);
+    if (currentValue) safeNotify(currentValue);
 
     try {
       Object.defineProperty(targetWindow, "PIXI", {
@@ -1009,7 +1017,7 @@ void main(void) {
           if (previousSet) previousSet.call(targetWindow, value);
           else currentValue = value;
           const assigned = previousGet ? previousGet.call(targetWindow) : value;
-          if (assigned) onAssigned(assigned);
+          if (assigned) safeNotify(assigned);
         },
       });
       return true;

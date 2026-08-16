@@ -794,6 +794,21 @@ test("installPixiHookは既存descriptorを保持して後続PIXI代入を通知
   assert.deepEqual(assigned, [pixi]);
 });
 
+test("installPixiHookは通知例外をPIXI代入元へ伝播させない", () => {
+  const targetWindow = {};
+  const pixi = createPixiHarness();
+  const originalWarn = console.warn;
+  console.warn = () => {};
+
+  try {
+    assert.equal(installPixiHook(targetWindow, () => { throw new Error("listener failure"); }), true);
+    assert.doesNotThrow(() => { targetWindow.PIXI = pixi; });
+    assert.equal(targetWindow.PIXI, pixi);
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
 test("registerSharpenMenuはAlt+Sを案内して設定を反転する", () => {
   const commands = [];
   const storedValues = [];
