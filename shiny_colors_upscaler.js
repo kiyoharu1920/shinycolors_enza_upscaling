@@ -2,9 +2,9 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.2.0
-// @description  PIXIの論理座標とCSS表示サイズを維持してCanvasを高解像度化します。Alt+Uで描画倍率、Alt+YでFilter解像度を切り替えられます。
-// @description:en Upscales the Canvas while preserving PIXI logical coordinates and CSS display size. Press Alt+U for the render scale and Alt+Y for the filter resolution.
+// @version      2.2.1
+// @description  PIXIの論理座標とCSS表示サイズを維持してCanvasを高解像度化します。Filter解像度はメニューから個別に変更できます。
+// @description:en Upscales the Canvas while preserving PIXI logical coordinates and CSS display size. Filter resolution can be configured separately from the menu.
 // @license      MIT
 // @match        https://shinycolors.enza.fun/*
 // @run-at       document-start
@@ -116,11 +116,12 @@
   const LEGACY_GM_KEY = "scale";
   const LEGACY_LOCAL_STORAGE_KEY = "enzaUpscaler.mode";
   const HOTKEY_LABEL = "Alt+U";
-  const FILTER_HOTKEY_LABEL = "Alt+Y";
+  // Filter解像度のホットキー切り替えは無効化中。
+  // const FILTER_HOTKEY_LABEL = "Alt+Y";
   /** @type {ScaleMode} */
   const DEFAULT_MODE = 2;
   /** @type {FilterMode} */
-  const DEFAULT_FILTER_MODE = "sync";
+  const DEFAULT_FILTER_MODE = 2;
   /** @type {readonly number[]} */
   const MANUAL_SCALES = Object.freeze([1, 1.5, 2, 3, 4]);
   const MIN_SCALE = MANUAL_SCALES[0];
@@ -202,16 +203,12 @@
     return MENU_MODES[(currentIndex + 1) % MENU_MODES.length];
   }
 
-  /**
-   * Alt+Yで次に使うFilter解像度を返す。
-   * @param {FilterMode} currentMode
-   * @returns {FilterMode}
-   */
-  function nextFilterMode(currentMode) {
-    const normalized = normalizeFilterMode(currentMode);
-    const currentIndex = FILTER_MENU_MODES.findIndex((candidate) => candidate === normalized);
-    return FILTER_MENU_MODES[(currentIndex + 1) % FILTER_MENU_MODES.length];
-  }
+  // Filter解像度のホットキー切り替えは無効化中。
+  // function nextFilterMode(currentMode) {
+  //   const normalized = normalizeFilterMode(currentMode);
+  //   const currentIndex = FILTER_MENU_MODES.findIndex((candidate) => candidate === normalized);
+  //   return FILTER_MENU_MODES[(currentIndex + 1) % FILTER_MENU_MODES.length];
+  // }
 
   /**
    * 連動モードでは実際のCanvas倍率、それ以外では選択したFilter倍率を返す。
@@ -239,21 +236,17 @@
     );
   }
 
-  /**
-   * Alt+YによるFilter解像度変更かを判定する。
-   * @param {Pick<KeyboardEvent, "altKey" | "ctrlKey" | "metaKey" | "shiftKey" | "repeat" | "key" | "code">} event
-   * @returns {boolean}
-   */
-  function isFilterHotkey(event) {
-    return (
-      event.altKey &&
-      !event.ctrlKey &&
-      !event.metaKey &&
-      !event.shiftKey &&
-      !event.repeat &&
-      (event.code === "KeyY" || event.key.toLowerCase() === "y")
-    );
-  }
+  // Filter解像度のホットキー切り替えは無効化中。
+  // function isFilterHotkey(event) {
+  //   return (
+  //     event.altKey &&
+  //     !event.ctrlKey &&
+  //     !event.metaKey &&
+  //     !event.shiftKey &&
+  //     !event.repeat &&
+  //     (event.code === "KeyY" || event.key.toLowerCase() === "y")
+  //   );
+  // }
 
   /**
    * 指定倍率をスクリプト上限とGPU上限へ収める。
@@ -562,7 +555,7 @@
   }
 
   /**
-   * Filter解像度選択メニューとAlt+Y案内をTampermonkeyへ登録する。
+   * Filter解像度選択メニューをTampermonkeyへ登録する。
    * @param {ShinyWindow} targetWindow
    * @param {FilterMode} currentMode
    * @param {((key: string, value: unknown) => void) | undefined} setValue
@@ -572,9 +565,8 @@
   function registerFilterMenu(targetWindow, currentMode, setValue, registerMenuCommand) {
     if (typeof registerMenuCommand !== "function") return;
 
-    registerMenuCommand(`ホットキー: ${FILTER_HOTKEY_LABEL}（Filter解像度を順番に切り替え）`, () => {
-      // Tampermonkeyメニューに無効項目はないため、案内専用の空処理とする。
-    });
+    // Filter解像度のホットキー切り替えは無効化中。
+    // registerMenuCommand(`ホットキー: ${FILTER_HOTKEY_LABEL}（Filter解像度を順番に切り替え）`, () => {});
 
     for (const mode of FILTER_MENU_MODES) {
       const selected = mode === currentMode ? " ✓" : "";
@@ -777,26 +769,24 @@
         "keydown",
         (event) => {
           const changesRenderScale = isUpscalerHotkey(event);
-          const changesFilterScale = isFilterHotkey(event);
-          if (!changesRenderScale && !changesFilterScale) return;
+          // Filter解像度のホットキー切り替えは無効化中。
+          // const changesFilterScale = isFilterHotkey(event);
+          if (!changesRenderScale) return;
           event.preventDefault();
           event.stopPropagation();
-          if (changesRenderScale) {
-            mode = nextMode(mode);
-            writeMode(targetWindow, mode, api.GM_setValue);
-            const result = apply(true);
-            const label = mode === "auto" ? "自動" : `${mode}x`;
-            const actual = mode === "auto" && result ? ` → ${result.scale}x` : "";
-            showToast(`Canvas描画倍率: ${label}${actual}`);
-            return;
-          }
+          mode = nextMode(mode);
+          writeMode(targetWindow, mode, api.GM_setValue);
+          const result = apply(true);
+          const label = mode === "auto" ? "自動" : `${mode}x`;
+          const actual = mode === "auto" && result ? ` → ${result.scale}x` : "";
+          showToast(`Canvas描画倍率: ${label}${actual}`);
 
-          filterMode = nextFilterMode(filterMode);
-          writeFilterMode(targetWindow, filterMode, api.GM_setValue);
-          const result = apply(false);
-          const label = filterMode === "sync" ? "Canvas倍率に連動" : `${filterMode}x`;
-          const actual = filterMode === "sync" && result ? ` → ${result.filterScale}x` : "";
-          showToast(`Filter解像度: ${label}${actual}`);
+          // Filter解像度のホットキー切り替えは無効化中。
+          // filterMode = nextFilterMode(filterMode);
+          // writeFilterMode(targetWindow, filterMode, api.GM_setValue);
+          // const filterResult = apply(false);
+          // const filterLabel = filterMode === "sync" ? "Canvas倍率に連動" : `${filterMode}x`;
+          // showToast(`Filter解像度: ${filterLabel} → ${filterResult?.filterScale ?? "-"}x`);
         },
         true,
       );
@@ -846,10 +836,10 @@
       computeAutoScale,
       createUpscalerRuntime,
       getGpuScaleLimit,
-      isFilterHotkey,
+      // isFilterHotkey,
       installEzgHook,
       isUpscalerHotkey,
-      nextFilterMode,
+      // nextFilterMode,
       nextMode,
       normalizeFilterMode,
       normalizeMode,
