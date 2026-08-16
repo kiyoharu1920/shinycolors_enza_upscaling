@@ -97,7 +97,7 @@
    * @property {FilterMode} filterMode
    * @property {number | null} filterScale
    * @property {() => ApplyResult | null} apply
-   * @property {() => Record<string, unknown>} info
+   * @property {() => DiagnosticInfo} info
    */
 
   /**
@@ -110,25 +110,55 @@
    * @property {number=} filterScale
    */
 
+  /**
+   * DevToolsへ公開する現在の描画状態。
+   * @typedef {object} DiagnosticInfo
+   * @property {ScaleMode} mode
+   * @property {number | null} scale
+   * @property {FilterMode} filterMode
+   * @property {number | null} filterScale
+   * @property {number | null} rendererResolution
+   * @property {[number, number] | null} logical
+   * @property {[number, number] | null} backingStore
+   * @property {[number, number] | null} cssSize
+   * @property {number} devicePixelRatio
+   */
+
+  /**
+   * アップスケーラーの起動・適用・診断操作。
+   * @typedef {object} UpscalerRuntime
+   * @property {() => void} start
+   * @property {(force?: boolean) => ApplyResult | null} apply
+   * @property {() => DiagnosticInfo} info
+   */
+
+  /** コンソール出力を識別する接頭辞。 @type {string} */
   const LOG_PREFIX = "[shiny-colors-upscaler]";
+  /** Canvas描画倍率を保存する現行キー。 @type {string} */
   const STORAGE_KEY = "canvas-render-scale";
+  /** Filter解像度を保存する現行キー。 @type {string} */
   const FILTER_STORAGE_KEY = "canvas-filter-scale";
+  /** 旧版のGMストレージからCanvas倍率を移行するキー。 @type {string} */
   const LEGACY_GM_KEY = "scale";
+  /** 旧版のlocalStorageからCanvas倍率を移行するキー。 @type {string} */
   const LEGACY_LOCAL_STORAGE_KEY = "enzaUpscaler.mode";
+  /** Canvas描画倍率を切り替えるホットキー表示名。 @type {string} */
   const HOTKEY_LABEL = "Alt+U";
   // Filter解像度のホットキー切り替えは無効化中。
   // const FILTER_HOTKEY_LABEL = "Alt+Y";
-  /** @type {ScaleMode} */
+  /** Canvas描画倍率の既定値。 @type {ScaleMode} */
   const DEFAULT_MODE = 2;
-  /** @type {FilterMode} */
+  /** Filter解像度の既定値。 @type {FilterMode} */
   const DEFAULT_FILTER_MODE = 2;
-  /** @type {readonly number[]} */
+  /** 手動選択できる共通倍率一覧。 @type {readonly number[]} */
   const MANUAL_SCALES = Object.freeze([1, 1.5, 2, 3, 4]);
+  /** 手動倍率一覧の最小値。 @type {number} */
   const MIN_SCALE = MANUAL_SCALES[0];
+  /** 手動倍率一覧の最大値。 @type {number} */
   const MAX_SCALE = MANUAL_SCALES[MANUAL_SCALES.length - 1];
-  /** @type {readonly ScaleMode[]} */
+  /** Canvas描画倍率メニューとAlt+Uの巡回順。 @type {readonly ScaleMode[]} */
   const MENU_MODES = Object.freeze(["auto", ...MANUAL_SCALES]);
-  /** @type {readonly FilterMode[]} */
+  /** Filter解像度メニューの表示順。 @type {readonly FilterMode[]} */
   const FILTER_MENU_MODES = Object.freeze(["sync", ...MANUAL_SCALES]);
 
   /**
@@ -646,28 +676,28 @@
    * ブラウザ依存は引数から受け取り、起動前でも倍率適用と診断情報を検証できるようにする。
    * @param {ShinyWindow} targetWindow
    * @param {UserscriptApi} api
-   * @returns {{
-   *   start: () => void,
-   *   apply: (force?: boolean) => ApplyResult | null,
-   *   info: () => Record<string, unknown>
-   * }}
+   * @returns {UpscalerRuntime}
    */
   function createUpscalerRuntime(targetWindow, api) {
+    /** 現在選択されているCanvas描画倍率。 @type {ScaleMode} */
     let mode = readMode(targetWindow, api.GM_getValue);
+    /** 現在選択されているFilter解像度。 @type {FilterMode} */
     let filterMode = readFilterMode(targetWindow, api.GM_getValue);
-    /** @type {EzgApi | null} */
+    /** window.ezgがnull化される前に保持した参照。 @type {EzgApi | null} */
     let capturedEzg = null;
-    /** @type {ApplyResult | null} */
+    /** 最後に成功した倍率適用結果。 @type {ApplyResult | null} */
     let lastResult = null;
-    // Rendererは画面遷移で再生成されるため、現在監視対象として認識している個体を追跡する。
-    /** @type {PixiRenderer | null} */
+    /** 画面遷移による再生成を検出するため、現在のRendererを保持する。 @type {PixiRenderer | null} */
     let activeRenderer = null;
-    /** @type {ResizeObserver | null} */
+    /** 現在のCanvasサイズ監視。 @type {ResizeObserver | null} */
     let resizeObserver = null;
+    /** イベントを二重登録しないための監視済みCanvas集合。 @type {WeakSet<object>} */
     const observedViews = new WeakSet();
-    /** @type {HTMLDivElement | null} */
+    /** 画面左下へ設定結果を表示する要素。 @type {HTMLDivElement | null} */
     let toastElement = null;
+    /** トースト非表示タイマーの識別子。 @type {number} */
     let toastTimer = 0;
+    /** 同じruntimeの二重起動を防止するフラグ。 @type {boolean} */
     let started = false;
 
     /**
@@ -693,6 +723,11 @@
       }, 1800);
     };
 
+    /**
+     * 現在の設定をRendererとシーンへ適用する。
+     * @param {boolean} [force=false] 適用済みでもRendererを再設定するか
+     * @returns {ApplyResult | null}
+     */
     const apply = (force = false) => {
       const game = resolveGame(targetWindow, capturedEzg);
       if (!game?.renderer) return null;
@@ -708,6 +743,10 @@
       return lastResult;
     };
 
+    /**
+     * Rendererの差し替えとCanvasイベント監視を更新する。
+     * @returns {void}
+     */
     const observeCurrentRenderer = () => {
       const renderer = resolveGame(targetWindow, capturedEzg)?.renderer;
       if (!renderer?.view) return;
@@ -729,6 +768,10 @@
       }
     };
 
+    /**
+     * 現在の設定と描画サイズを診断用オブジェクトへまとめる。
+     * @returns {DiagnosticInfo}
+     */
     const info = () => {
       const game = resolveGame(targetWindow, capturedEzg);
       const renderer = game?.renderer;
@@ -747,6 +790,10 @@
       };
     };
 
+    /**
+     * メニュー、ゲーム参照フック、画面監視、診断APIを一度だけ登録する。
+     * @returns {void}
+     */
     const start = () => {
       // 二重起動はメニュー・監視・ホットキー処理を重複登録するため、同じruntimeでは一度だけ開始する。
       if (started) return;
