@@ -2,9 +2,9 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.5.0
-// @description  Canvasを高解像度化します。描画倍率とFilter解像度は個別に変更できます。
-// @description:en Upscales the Canvas. Render and filter resolutions can be configured separately.
+// @version      2.5.1
+// @description  Shiny ColorsのCanvasを高解像度化します。
+// @description:en Upscales the Canvas of Shiny Colors.
 // @license      MIT
 // @match        https://shinycolors.enza.fun/*
 // @run-at       document-start
