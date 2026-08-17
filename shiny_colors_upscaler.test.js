@@ -18,10 +18,13 @@ const {
   isSharpenHotkey,
   isUpscalerHotkey,
   nextMode,
+  nextSharpenMode,
   normalizeFilterMode,
   normalizeMode,
+  normalizeSharpenMode,
   readFilterMode,
   readMode,
+  readSharpenMode,
   registerFilterMenu,
   registerScaleMenu,
   registerSharpenMenu,
@@ -498,7 +501,7 @@ test("ブラウザ読込時はunsafeWindowを選びruntimeを自動起動する"
   assert.equal(pageHarness.countListeners("orientationchange"), 1);
   assert.equal(pageHarness.countListeners("keydown"), 1);
   assert.equal(pageHarness.countIntervals(1000), 1);
-  assert.equal(menuCommands.length, 14);
+  assert.equal(menuCommands.length, 18);
   assert.match(menuCommands[0].caption, /Alt\+U/);
   assert.match(menuCommands[7].caption, /Canvas倍率に連動/);
 
@@ -507,6 +510,19 @@ test("ブラウザ読込時はunsafeWindowを選びruntimeを自動起動する"
   assert.equal(managerHarness.countListeners("orientationchange"), 0);
   assert.equal(managerHarness.countListeners("keydown"), 0);
   assert.equal(managerHarness.countIntervals(1000), 0);
+});
+
+test("readSharpenModeは強度を読み、旧ON値と未設定値を中へ移行する", () => {
+  const values = new Map([["spine-sharpen-enabled", "weak"]]);
+  const targetWindow = { localStorage: { getItem: (key) => values.get(key) ?? null } };
+
+  assert.equal(readSharpenMode(targetWindow, (key, fallback) =>
+    key === "spine-sharpen-enabled" ? "strong" : fallback), "strong");
+  assert.equal(readSharpenMode(targetWindow, (_key, fallback) => fallback), "weak");
+  values.set("spine-sharpen-enabled", "true");
+  assert.equal(readSharpenMode(targetWindow, (_key, fallback) => fallback), "medium");
+  values.clear();
+  assert.equal(readSharpenMode(targetWindow, (_key, fallback) => fallback), "medium");
 });
 
 test("Stayがレキシカルに注入するGM APIで設定メニューを登録する", () => {
@@ -541,7 +557,7 @@ test("Stayがレキシカルに注入するGM APIで設定メニューを登録�
   );
 
   assert.equal(pageHarness.targetWindow.__shinyColorsUpscaler.mode, 3);
-  assert.equal(menuCommands.length, 14);
+  assert.equal(menuCommands.length, 18);
   assert.match(menuCommands[0].caption, /Alt\+U/);
   menuCommands.find(({ caption }) => caption.includes("Canvas描画倍率 4x")).onClick();
   assert.deepEqual(storedValues, [["canvas-render-scale", 4]]);
@@ -567,7 +583,7 @@ test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供�
   harness.targetWindow.ezg = null;
   harness.runTimeouts(0);
 
-  assert.equal(menuCommands.length, 14);
+  assert.equal(menuCommands.length, 18);
   assert.equal(harness.countListeners("keydown"), 1);
   assert.equal(renderer.resolution, 2);
   assert.equal(renderer.rootRenderTarget.resolution, 2);
@@ -584,6 +600,7 @@ test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供�
     scale: 2,
     filterMode: 2,
     filterScale: 2,
+    sharpenMode: "medium",
     sharpenEnabled: true,
     sharpenedSpines: 0,
     rendererResolution: 2,
@@ -702,6 +719,17 @@ test("isUpscalerHotkeyは修飾なしのAlt+Uだけを受け付ける", () => {
   assert.equal(isUpscalerHotkey({ ...event, repeat: true }), false);
   assert.equal(isUpscalerHotkey({ ...event, ctrlKey: true }), false);
   assert.equal(isUpscalerHotkey({ ...event, key: "x", code: "KeyX" }), false);
+});
+
+test("Spineシャープ化モードはOFF・弱・中・強を巡回し、旧ON/OFF値を移行する", () => {
+  assert.equal(nextSharpenMode("off"), "weak");
+  assert.equal(nextSharpenMode("weak"), "medium");
+  assert.equal(nextSharpenMode("medium"), "strong");
+  assert.equal(nextSharpenMode("strong"), "off");
+  assert.equal(normalizeSharpenMode(true), "medium");
+  assert.equal(normalizeSharpenMode(false), "off");
+  assert.equal(normalizeSharpenMode("弱"), "weak");
+  assert.equal(normalizeSharpenMode("unknown"), "medium");
 });
 
 test("isSharpenHotkeyは修飾なしのAlt+Sだけを受け付ける", () => {
@@ -861,7 +889,7 @@ test("installPixiHookは通知例外をPIXI代入元へ伝播させない", () =
   }
 });
 
-test("registerSharpenMenuはAlt+Sを案内して設定を反転する", () => {
+test("registerSharpenMenuはAlt+Sを案内し、OFF・弱・中・強を選択できる", () => {
   const commands = [];
   const storedValues = [];
   let reloadCount = 0;
@@ -869,20 +897,24 @@ test("registerSharpenMenuはAlt+Sを案内して設定を反転する", () => {
 
   registerSharpenMenu(
     targetWindow,
-    true,
+    "medium",
     (key, value) => storedValues.push([key, value]),
     (caption, onClick) => commands.push({ caption, onClick }),
   );
 
-  assert.equal(commands.length, 1);
+  assert.equal(commands.length, 5);
   assert.match(commands[0].caption, /Alt\+S/);
-  assert.match(commands[0].caption, /ON/);
   commands[0].onClick();
-  assert.deepEqual(storedValues, [["spine-sharpen-enabled", false]]);
+  assert.deepEqual(storedValues, []);
+  assert.equal(reloadCount, 0);
+  assert.match(commands.find(({ caption }) => caption.includes("中")).caption, /✓/);
+
+  commands.find(({ caption }) => caption.includes("強")).onClick();
+  assert.deepEqual(storedValues, [["spine-sharpen-enabled", "strong"]]);
   assert.equal(reloadCount, 1);
 });
 
-test("runtimeはAlt+SでSpineシャープ化だけを即時切り替えて保存する", () => {
+test("runtimeはAlt+SでSpineシャープ化を中・強・OFF・弱へ即時切り替えて保存する", () => {
   const harness = createWindowHarness();
   const pixi = createPixiHarness();
   const stage = new pixi.Container();
@@ -904,6 +936,8 @@ test("runtimeはAlt+SでSpineシャープ化だけを即時切り替えて保存
   harness.runTimeouts(0);
 
   assert.equal(spine.filters.length, 1);
+  assert.equal(spine.filters[0].uniforms.sharpness, 0.7);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenMode, "medium");
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenEnabled, true);
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.info().sharpenedSpines, 1);
 
@@ -920,14 +954,24 @@ test("runtimeはAlt+SでSpineシャープ化だけを即時切り替えて保存
   };
   harness.dispatch("keydown", event);
 
+  assert.equal(spine.filters.length, 1);
+  assert.equal(spine.filters[0].uniforms.sharpness, 1.05);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenMode, "strong");
+  assert.deepEqual(storedValues.at(-1), ["spine-sharpen-enabled", "strong"]);
+  assert.equal(harness.appendedElements.at(-1).textContent, "Spineシャープ化: 強");
+
+  harness.dispatch("keydown", event);
   assert.deepEqual(spine.filters, []);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenMode, "off");
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenEnabled, false);
-  assert.deepEqual(storedValues.at(-1), ["spine-sharpen-enabled", false]);
+  assert.deepEqual(storedValues.at(-1), ["spine-sharpen-enabled", "off"]);
   assert.equal(harness.appendedElements.at(-1).textContent, "Spineシャープ化: OFF");
 
   harness.dispatch("keydown", event);
   assert.equal(spine.filters.length, 1);
+  assert.equal(spine.filters[0].uniforms.sharpness, 0.35);
+  assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenMode, "weak");
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.sharpenEnabled, true);
-  assert.deepEqual(storedValues.at(-1), ["spine-sharpen-enabled", true]);
-  assert.equal(harness.appendedElements.at(-1).textContent, "Spineシャープ化: ON");
+  assert.deepEqual(storedValues.at(-1), ["spine-sharpen-enabled", "weak"]);
+  assert.equal(harness.appendedElements.at(-1).textContent, "Spineシャープ化: 弱");
 });

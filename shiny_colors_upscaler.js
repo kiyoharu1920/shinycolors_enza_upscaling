@@ -2,9 +2,9 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.3.2
-// @description  Canvasを高解像度化し、Spineキャラクターだけをシャープ化します。描画倍率とFilter解像度は個別に変更できます。
-// @description:en Upscales the Canvas and sharpens only Spine characters. Render and filter resolutions can be configured separately.
+// @version      2.4.0
+// @description  Canvasを高解像度化し、Spineキャラクターだけを選択した強度でシャープ化します。描画倍率とFilter解像度は個別に変更できます。
+// @description:en Upscales the Canvas and sharpens only Spine characters at the selected strength. Render and filter resolutions can be configured separately.
 // @license      MIT
 // @match        https://shinycolors.enza.fun/*
 // @run-at       document-start
@@ -22,6 +22,7 @@
 
   /** @typedef {"auto" | number} ScaleMode */
   /** @typedef {"sync" | number} FilterMode */
+  /** @typedef {"off" | "weak" | "medium" | "strong"} SharpenMode */
 
   /**
    * PIXI Filterのうち本スクリプトが利用する最小構造。
@@ -136,6 +137,7 @@
    * @property {number | null} scale
    * @property {FilterMode} filterMode
    * @property {number | null} filterScale
+   * @property {SharpenMode} sharpenMode
    * @property {boolean} sharpenEnabled
    * @property {() => ApplyResult | null} apply
    * @property {() => DiagnosticInfo} info
@@ -158,6 +160,7 @@
    * @property {number | null} scale
    * @property {FilterMode} filterMode
    * @property {number | null} filterScale
+   * @property {SharpenMode} sharpenMode
    * @property {boolean} sharpenEnabled
    * @property {number} sharpenedSpines
    * @property {number | null} rendererResolution
@@ -197,8 +200,8 @@
   const DEFAULT_MODE = 2;
   /** Filter解像度の既定値。 @type {FilterMode} */
   const DEFAULT_FILTER_MODE = 2;
-  /** Spineシャープ化の既定状態。 @type {boolean} */
-  const DEFAULT_SHARPEN_ENABLED = true;
+  /** Spineシャープ化の既定強度。 @type {SharpenMode} */
+  const DEFAULT_SHARPEN_MODE = "medium";
   /** Spineシャープ化の強度。 @type {number} */
   const SHARPEN_AMOUNT = 0.7;
   /** 本スクリプトが生成したFilterを識別するプロパティ。 @type {string} */
@@ -238,6 +241,12 @@ void main(void) {
   const MENU_MODES = Object.freeze(["auto", ...MANUAL_SCALES]);
   /** Filter解像度メニューの表示順。 @type {readonly FilterMode[]} */
   const FILTER_MENU_MODES = Object.freeze(["sync", ...MANUAL_SCALES]);
+  /** Spineシャープ化の切替順。 @type {readonly SharpenMode[]} */
+  const SHARPEN_MODES = Object.freeze(["off", "weak", "medium", "strong"]);
+  /** Spineシャープ化モードの表示名。 @type {Readonly<Record<SharpenMode, string>>} */
+  const SHARPEN_MODE_LABELS = Object.freeze({ off: "OFF", weak: "弱", medium: "中", strong: "強" });
+  /** Spineシャープ化モードごとの補正量。 @type {Readonly<Record<SharpenMode, number>>} */
+  const SHARPEN_AMOUNTS = Object.freeze({ off: 0, weak: 0.35, medium: 0.7, strong: 1.05 });
 
   /**
    * 倍率一覧を設定の唯一の基準にする。旧版の2.5x/3.5xは同距離なら低い倍率へ移行する。
@@ -345,19 +354,32 @@ void main(void) {
   }
 
   /**
-   * 保存値をSpineシャープ化の有効状態へ正規化する。
+   * 保存値をSpineシャープ化モードへ正規化し、旧ON/OFF値も移行する。
    * @param {unknown} value
-   * @returns {boolean}
+   * @returns {SharpenMode}
    */
-  function normalizeSharpenEnabled(value) {
-    if (typeof value === "boolean") return value;
-    if (typeof value === "number") return value !== 0;
-    if (typeof value === "string") {
-      const normalized = value.trim().toLowerCase();
-      if (["false", "0", "off"].includes(normalized)) return false;
-      if (["true", "1", "on"].includes(normalized)) return true;
-    }
-    return DEFAULT_SHARPEN_ENABLED;
+  function normalizeSharpenMode(value) {
+    if (value === true || value === 1) return "medium";
+    if (value === false || value === 0) return "off";
+    if (typeof value !== "string") return DEFAULT_SHARPEN_MODE;
+
+    const normalized = value.trim().toLowerCase();
+    if (["off", "false", "0"].includes(normalized)) return "off";
+    if (["weak", "弱"].includes(normalized)) return "weak";
+    if (["medium", "中", "on", "true", "1"].includes(normalized)) return "medium";
+    if (["strong", "強"].includes(normalized)) return "strong";
+    return DEFAULT_SHARPEN_MODE;
+  }
+
+  /**
+   * ホットキーで次に使うSpineシャープ化モードを返す。
+   * @param {SharpenMode} currentMode
+   * @returns {SharpenMode}
+   */
+  function nextSharpenMode(currentMode) {
+    const normalized = normalizeSharpenMode(currentMode);
+    const currentIndex = SHARPEN_MODES.indexOf(normalized);
+    return SHARPEN_MODES[(currentIndex + 1) % SHARPEN_MODES.length];
   }
 
   /**
@@ -662,9 +684,10 @@ void main(void) {
    * @param {Iterable<PixiNamespace>} pixiCopies
    * @param {boolean} enabled
    * @param {number} resolution
+   * @param {number=} amount
    * @returns {number} シャープ化が有効なSpine数
    */
-  function syncSpineSharpening(stage, pixiCopies, enabled, resolution) {
+  function syncSpineSharpening(stage, pixiCopies, enabled, resolution, amount = SHARPEN_AMOUNT) {
     if (!stage || !Number.isFinite(resolution) || resolution <= 0) return 0;
 
     const pending = [stage];
@@ -677,7 +700,7 @@ void main(void) {
 
       if (isSpineDisplayObject(node)) {
         const pixi = findPixiForDisplayObject(pixiCopies, node);
-        if (setSpineSharpening(node, pixi, enabled, resolution)) sharpened += 1;
+        if (setSpineSharpening(node, pixi, enabled, resolution, amount)) sharpened += 1;
       }
       if (Array.isArray(node.children)) pending.push(...node.children);
     }
@@ -837,25 +860,25 @@ void main(void) {
   }
 
   /**
-   * Spineシャープ化設定を読む。未設定時は有効にする。
+   * Spineシャープ化モードを読む。旧ON/OFF値は中/OFFへ移行する。
    * @param {ShinyWindow} targetWindow
    * @param {((key: string, defaultValue: unknown) => unknown) | undefined} getValue
-   * @returns {boolean}
+   * @returns {SharpenMode}
    */
-  function readSharpenEnabled(targetWindow, getValue) {
+  function readSharpenMode(targetWindow, getValue) {
     const missing = `__missing_${Date.now()}_${Math.random()}__`;
     if (typeof getValue === "function") {
       const current = getValue(SHARPEN_STORAGE_KEY, missing);
-      if (current !== missing) return normalizeSharpenEnabled(current);
+      if (current !== missing) return normalizeSharpenMode(current);
     }
 
     try {
       const currentLocal = targetWindow.localStorage?.getItem(SHARPEN_STORAGE_KEY);
-      if (currentLocal !== null && currentLocal !== undefined) return normalizeSharpenEnabled(currentLocal);
+      if (currentLocal !== null && currentLocal !== undefined) return normalizeSharpenMode(currentLocal);
     } catch (error) {
       console.warn(`${LOG_PREFIX} Spineシャープ化設定を読めませんでした。`, error);
     }
-    return DEFAULT_SHARPEN_ENABLED;
+    return DEFAULT_SHARPEN_MODE;
   }
 
   /**
@@ -897,19 +920,19 @@ void main(void) {
   }
 
   /**
-   * Spineシャープ化設定を保存する。
+   * Spineシャープ化モードを保存する。
    * @param {ShinyWindow} targetWindow
-   * @param {boolean} enabled
+   * @param {SharpenMode} mode
    * @param {((key: string, value: unknown) => void) | undefined} setValue
    * @returns {void}
    */
-  function writeSharpenEnabled(targetWindow, enabled, setValue) {
+  function writeSharpenMode(targetWindow, mode, setValue) {
     if (typeof setValue === "function") {
-      setValue(SHARPEN_STORAGE_KEY, enabled);
+      setValue(SHARPEN_STORAGE_KEY, mode);
       return;
     }
     try {
-      targetWindow.localStorage?.setItem(SHARPEN_STORAGE_KEY, String(enabled));
+      targetWindow.localStorage?.setItem(SHARPEN_STORAGE_KEY, mode);
     } catch (error) {
       console.warn(`${LOG_PREFIX} Spineシャープ化設定を保存できませんでした。`, error);
     }
@@ -966,20 +989,28 @@ void main(void) {
   }
 
   /**
-   * Spineシャープ化の現在状態とホットキーをUserscript Managerのメニューへ登録する。
+   * Spineシャープ化の強度選択とホットキー案内をUserscript Managerへ登録する。
    * @param {ShinyWindow} targetWindow
-   * @param {boolean} enabled
+   * @param {SharpenMode} currentMode
    * @param {((key: string, value: unknown) => void) | undefined} setValue
    * @param {((caption: string, onClick: () => void) => unknown) | undefined} registerMenuCommand
    * @returns {void}
    */
-  function registerSharpenMenu(targetWindow, enabled, setValue, registerMenuCommand) {
+  function registerSharpenMenu(targetWindow, currentMode, setValue, registerMenuCommand) {
     if (typeof registerMenuCommand !== "function") return;
-    const label = enabled ? "ON ✓" : "OFF";
-    registerMenuCommand(`Spineシャープ化 ${label}（${SHARPEN_HOTKEY_LABEL}で切り替え）`, () => {
-      writeSharpenEnabled(targetWindow, !enabled, setValue);
-      targetWindow.location.reload();
+    const normalized = normalizeSharpenMode(currentMode);
+
+    registerMenuCommand(`ホットキー: ${SHARPEN_HOTKEY_LABEL}（シャープ化を順番に切り替え）`, () => {
+      // Userscript Managerのメニューに無効項目はないため、案内専用の空処理とする。
     });
+
+    for (const mode of SHARPEN_MODES) {
+      const selected = mode === normalized ? " ✓" : "";
+      registerMenuCommand(`Spineシャープ化 ${SHARPEN_MODE_LABELS[mode]}${selected}`, () => {
+        writeSharpenMode(targetWindow, mode, setValue);
+        targetWindow.location.reload();
+      });
+    }
   }
 
   /**
@@ -1104,8 +1135,8 @@ void main(void) {
     let mode = readMode(targetWindow, api.GM_getValue);
     /** 現在選択されているFilter解像度。 @type {FilterMode} */
     let filterMode = readFilterMode(targetWindow, api.GM_getValue);
-    /** Spineシャープ化の現在状態。 @type {boolean} */
-    let sharpenEnabled = readSharpenEnabled(targetWindow, api.GM_getValue);
+    /** Spineシャープ化の現在強度。 @type {SharpenMode} */
+    let sharpenMode = readSharpenMode(targetWindow, api.GM_getValue);
     /** window.ezgがnull化される前に保持した参照。 @type {EzgApi | null} */
     let capturedEzg = null;
     /** 最後に成功した倍率適用結果。 @type {ApplyResult | null} */
@@ -1144,8 +1175,9 @@ void main(void) {
       return syncSpineSharpening(
         resolveStage(targetWindow, capturedEzg, game),
         pixiCopies,
-        sharpenEnabled,
+        sharpenMode !== "off",
         getSharpenResolution(),
+        SHARPEN_AMOUNTS[sharpenMode],
       );
     };
 
@@ -1158,8 +1190,9 @@ void main(void) {
       setSpineSharpening(
         spine,
         findPixiForDisplayObject(pixiCopies, spine),
-        sharpenEnabled,
+        sharpenMode !== "off",
         getSharpenResolution(),
+        SHARPEN_AMOUNTS[sharpenMode],
       );
     };
 
@@ -1217,7 +1250,13 @@ void main(void) {
         filterMode,
       );
       if (lastResult) {
-        syncSpineSharpening(stage, pixiCopies, sharpenEnabled, lastResult.filterScale ?? lastResult.scale);
+        syncSpineSharpening(
+          stage,
+          pixiCopies,
+          sharpenMode !== "off",
+          lastResult.filterScale ?? lastResult.scale,
+          SHARPEN_AMOUNTS[sharpenMode],
+        );
       }
       return lastResult;
     };
@@ -1259,7 +1298,8 @@ void main(void) {
         scale: lastResult?.scale ?? null,
         filterMode,
         filterScale: lastResult?.filterScale ?? null,
-        sharpenEnabled,
+        sharpenMode,
+        sharpenEnabled: sharpenMode !== "off",
         sharpenedSpines: countSharpenedSpines(resolveStage(targetWindow, capturedEzg, game)),
         rendererResolution: renderer?.resolution ?? null,
         logical: game ? [game.width, game.height] : null,
@@ -1282,7 +1322,7 @@ void main(void) {
 
       registerScaleMenu(targetWindow, mode, api.GM_setValue, api.GM_registerMenuCommand);
       registerFilterMenu(targetWindow, filterMode, api.GM_setValue, api.GM_registerMenuCommand);
-      registerSharpenMenu(targetWindow, sharpenEnabled, api.GM_setValue, api.GM_registerMenuCommand);
+      registerSharpenMenu(targetWindow, sharpenMode, api.GM_setValue, api.GM_registerMenuCommand);
       installPixiHook(targetWindow, onPixiAssigned);
       installEzgHook(targetWindow, (ezg) => {
         // ゲーム側はwindow.ezgを同期的にnull化するため、タイマーへ渡す前に参照を保持する。
@@ -1306,10 +1346,10 @@ void main(void) {
           event.preventDefault();
           event.stopPropagation();
           if (changesSharpen) {
-            sharpenEnabled = !sharpenEnabled;
-            writeSharpenEnabled(targetWindow, sharpenEnabled, api.GM_setValue);
+            sharpenMode = nextSharpenMode(sharpenMode);
+            writeSharpenMode(targetWindow, sharpenMode, api.GM_setValue);
             applySpineSharpening();
-            showToast(`Spineシャープ化: ${sharpenEnabled ? "ON" : "OFF"}`);
+            showToast(`Spineシャープ化: ${SHARPEN_MODE_LABELS[sharpenMode]}`);
             return;
           }
           mode = nextMode(mode);
@@ -1346,8 +1386,11 @@ void main(void) {
         get filterScale() {
           return lastResult?.filterScale ?? null;
         },
+        get sharpenMode() {
+          return sharpenMode;
+        },
         get sharpenEnabled() {
-          return sharpenEnabled;
+          return sharpenMode !== "off";
         },
         apply: () => apply(true),
         info,
@@ -1406,12 +1449,13 @@ void main(void) {
       isUpscalerHotkey,
       // nextFilterMode,
       nextMode,
+      nextSharpenMode,
       normalizeFilterMode,
       normalizeMode,
-      normalizeSharpenEnabled,
+      normalizeSharpenMode,
       readFilterMode,
       readMode,
-      readSharpenEnabled,
+      readSharpenMode,
       registerFilterMenu,
       registerScaleMenu,
       registerSharpenMenu,
