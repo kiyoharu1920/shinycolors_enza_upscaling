@@ -1,0 +1,21 @@
+# OS生成ファイル
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# エディタ・IDE
+.vscode/
+.idea/
+*.swp
+
+# Node.js（テスト実行用）
+node_modules/
+npm-debug.log*
+
+# Claude Codeのローカル設定
+.claude/settings.local.json
+
+# ログ・一時ファイル
+*.log
+*.tmp
