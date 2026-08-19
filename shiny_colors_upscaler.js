@@ -2,7 +2,7 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.5.1
+// @version      2.6.0
 // @description  Shiny ColorsのCanvasを高解像度化します。
 // @description:en Upscales the Canvas of Shiny Colors.
 // @license      MIT
@@ -22,6 +22,7 @@
 
   /** @typedef {"auto" | number} ScaleMode */
   /** @typedef {"sync" | number} FilterMode */
+  /** Rendererをどの経路で取得したか。 @typedef {"ezg" | "pixi" | "none"} RendererSource */
 
   /**
    * このスクリプトが利用するPIXI DisplayObjectの最小構造。
@@ -78,7 +79,7 @@
    */
 
   /** @typedef {{ game?: EzgGame, sceneManager?: { stage?: PixiDisplayObject } }} EzgApi */
-  /** @typedef {Window & typeof globalThis & { ezg?: EzgApi, __shinyColorsUpscaler?: DiagnosticApi }} ShinyWindow */
+  /** @typedef {Window & typeof globalThis & { ezg?: EzgApi, PIXI?: object, __shinyColorsUpscaler?: DiagnosticApi }} ShinyWindow */
 
   /**
    * Userscript Managerが公開するAPI。
@@ -96,6 +97,7 @@
    * @property {number | null} scale
    * @property {FilterMode} filterMode
    * @property {number | null} filterScale
+   * @property {RendererSource} source
    * @property {() => ApplyResult | null} apply
    * @property {() => DiagnosticInfo} info
    */
@@ -122,6 +124,7 @@
    * @property {[number, number] | null} backingStore
    * @property {[number, number] | null} cssSize
    * @property {number} devicePixelRatio
+   * @property {RendererSource} source
    */
 
   /**
@@ -150,6 +153,15 @@
   const DEFAULT_MODE = 2;
   /** Filter解像度の既定値。 @type {FilterMode} */
   const DEFAULT_FILTER_MODE = 2;
+  /** PIXI名前空間から探すRendererコンストラクタ名。 @type {readonly string[]} */
+  const RENDERER_CTOR_NAMES = Object.freeze([
+    "Renderer",
+    "WebGLRenderer",
+    "CanvasRenderer",
+    "SystemRenderer",
+  ]);
+  /** renderを二重に包まないための目印。 @type {string} */
+  const PIXI_HOOK_FLAG = "__shinyColorsUpscalerHooked";
   /** 手動選択できる共通倍率一覧。 @type {readonly number[]} */
   const MANUAL_SCALES = Object.freeze([1, 1.5, 2, 3, 4]);
   /** 手動倍率一覧の最小値。 @type {number} */
@@ -609,32 +621,58 @@
   }
 
   /**
-   * ezg初回代入を同期的に捕捉する。ゲーム側が直後にwindow.ezgをnull化するため、
-   * setter内で参照を退避してから通常の書き換え可能プロパティへ戻す。
+   * ezgの代入を捕捉する。ゲーム側は代入直後にwindow.ezgをnull化するため、
+   * 実体が入るまでsetterを維持し、値を受け取ってから通常のプロパティへ戻す。
+   *
+   * Stayのようにゲーム本体より後で実行される環境ではezgが既にnull化済みなので、
+   * 「プロパティが存在する＝諦める」ではなく、再代入を待てるよう差し替える。
    * @param {ShinyWindow} targetWindow
    * @param {(value: EzgApi) => void} onAssigned
    * @returns {boolean}
    */
   function installEzgHook(targetWindow, onAssigned) {
-    if (targetWindow.ezg) {
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(targetWindow, "ezg");
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} ezgプロパティを参照できませんでした。`, error);
+      return false;
+    }
+
+    // 実体が既に入っているなら差し替えずにそのまま使う。
+    if (descriptor && descriptor.value) {
+      onAssigned(descriptor.value);
+      return true;
+    }
+    if (!descriptor && targetWindow.ezg) {
       onAssigned(targetWindow.ezg);
       return true;
     }
+    // 再定義できないプロパティは監視できない。
+    if (descriptor && descriptor.configurable === false) return false;
 
-    const descriptor = Object.getOwnPropertyDescriptor(targetWindow, "ezg");
-    if (descriptor) return false;
-
+    let stored = descriptor ? descriptor.value : undefined;
     try {
       Object.defineProperty(targetWindow, "ezg", {
         configurable: true,
         enumerable: true,
+        get() {
+          return stored;
+        },
         set(value) {
-          Object.defineProperty(targetWindow, "ezg", {
-            configurable: true,
-            enumerable: true,
-            writable: true,
-            value,
-          });
+          stored = value;
+          // null化の再代入では監視を続け、実体が入った時点でデータプロパティへ戻す。
+          if (!value) return;
+          try {
+            Object.defineProperty(targetWindow, "ezg", {
+              configurable: true,
+              enumerable: true,
+              writable: true,
+              value,
+            });
+          } catch (error) {
+            console.warn(`${LOG_PREFIX} ezgプロパティを復元できませんでした。`, error);
+          }
           onAssigned(value);
         },
       });
@@ -646,13 +684,177 @@
   }
 
   /**
-   * appがwindow.ezgをnull化した後も、代入時に捕捉した参照からGameを取得する。
+   * Rendererコンストラクタを持つPIXI名前空間を集める。
+   * グローバル名が`PIXI`とは限らないため、無ければwindow直下を走査する。
+   * getterは副作用を持ち得るので読まず、データプロパティの値だけを見る。
    * @param {ShinyWindow} targetWindow
-   * @param {EzgApi | null} capturedEzg
+   * @returns {object[]}
+   */
+  function findPixiNamespaces(targetWindow) {
+    /** @type {object[]} */
+    const namespaces = [];
+    /**
+     * @param {unknown} candidate
+     * @returns {boolean}
+     */
+    const hasRendererCtor = (candidate) => {
+      if (!candidate || typeof candidate !== "object") return false;
+      return RENDERER_CTOR_NAMES.some((name) => {
+        try {
+          return typeof (/** @type {Record<string, unknown>} */ (candidate)[name]) === "function";
+        } catch {
+          return false;
+        }
+      });
+    };
+
+    if (hasRendererCtor(targetWindow.PIXI)) namespaces.push(/** @type {object} */ (targetWindow.PIXI));
+
+    let names = [];
+    try {
+      names = Object.getOwnPropertyNames(targetWindow);
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} グローバルを走査できませんでした。`, error);
+      return namespaces;
+    }
+
+    for (const name of names) {
+      if (name === "PIXI") continue;
+      let value;
+      try {
+        // getterは副作用を避けるため呼ばない。
+        const descriptor = Object.getOwnPropertyDescriptor(targetWindow, name);
+        if (!descriptor || !("value" in descriptor)) continue;
+        value = descriptor.value;
+      } catch {
+        continue;
+      }
+      if (hasRendererCtor(value) && !namespaces.includes(value)) namespaces.push(value);
+    }
+
+    return namespaces;
+  }
+
+  /**
+   * 名前空間からrenderメソッドを持つprototypeを重複なく集める。
+   * 継承したrenderと、同じrender実装を共有するprototypeは除外する。
+   * @param {object[]} namespaces
+   * @returns {Record<string, unknown>[]}
+   */
+  function collectRenderPrototypes(namespaces) {
+    /** @type {Record<string, unknown>[]} */
+    const prototypes = [];
+    const seenRenderFns = new Set();
+
+    for (const namespace of namespaces) {
+      for (const ctorName of RENDERER_CTOR_NAMES) {
+        let prototype;
+        try {
+          const ctor = /** @type {Record<string, unknown>} */ (namespace)[ctorName];
+          if (typeof ctor !== "function") continue;
+          prototype = /** @type {Record<string, unknown>} */ (
+            /** @type {{ prototype?: unknown }} */ (ctor).prototype
+          );
+        } catch {
+          continue;
+        }
+        if (!prototype || typeof prototype !== "object") continue;
+        // 継承したrenderを包むと基底クラス側を二重に包むため、自前のものだけを対象にする。
+        if (!Object.prototype.hasOwnProperty.call(prototype, "render")) continue;
+        const renderFn = prototype.render;
+        if (typeof renderFn !== "function" || seenRenderFns.has(renderFn)) continue;
+        seenRenderFns.add(renderFn);
+        prototypes.push(prototype);
+      }
+    }
+
+    return prototypes;
+  }
+
+  /**
+   * PIXIのrenderを包み、実際に描画しているRendererとシーンを捕捉する。
+   * ezgを取得できない環境でも倍率を適用するための代替経路。
+   * @param {ShinyWindow} targetWindow
+   * @param {(renderer: PixiRenderer, stage: PixiDisplayObject | null) => void} onCapture
+   * @returns {boolean} フックを1つ以上設置できたか
+   */
+  function installPixiRendererHook(targetWindow, onCapture) {
+    const prototypes = collectRenderPrototypes(findPixiNamespaces(targetWindow));
+    let installed = false;
+
+    for (const prototype of prototypes) {
+      if (prototype[PIXI_HOOK_FLAG]) {
+        installed = true;
+        continue;
+      }
+      const originalRender = /** @type {(...args: unknown[]) => unknown} */ (prototype.render);
+      /**
+       * @this {PixiRenderer}
+       * @param {...unknown} args
+       */
+      const wrapped = function (...args) {
+        try {
+          const [displayObject, second] = args;
+          // 第2引数がRenderTextureの呼び出しはオフスクリーン描画なのでシーンとして扱わない。
+          const rendersToTexture =
+            !!second && typeof second === "object" && "baseTexture" in /** @type {object} */ (second);
+          // 画面に繋がっていないRendererは採用しない。
+          const connected = this?.view?.isConnected !== false;
+          if (!rendersToTexture && connected && typeof this?.resize === "function") {
+            onCapture(this, /** @type {PixiDisplayObject | null} */ (displayObject) ?? null);
+          }
+        } catch (error) {
+          // 捕捉に失敗しても描画は止めない。
+          console.warn(`${LOG_PREFIX} Renderer捕捉に失敗しました。`, error);
+        }
+        return originalRender.apply(this, args);
+      };
+
+      try {
+        prototype.render = wrapped;
+        Object.defineProperty(prototype, PIXI_HOOK_FLAG, {
+          configurable: true,
+          enumerable: false,
+          value: true,
+        });
+        installed = true;
+      } catch (error) {
+        console.warn(`${LOG_PREFIX} PIXIフックを設定できませんでした。`, error);
+      }
+    }
+
+    return installed;
+  }
+
+  /**
+   * 捕捉したRendererから、ezgに依存しない最小のGame相当オブジェクトを組み立てる。
+   * @param {PixiRenderer | null | undefined} renderer
    * @returns {EzgGame | null}
    */
-  function resolveGame(targetWindow, capturedEzg) {
-    return targetWindow.ezg?.game ?? capturedEzg?.game ?? null;
+  function createFallbackGame(renderer) {
+    if (!renderer) return null;
+
+    const resolution = Number(renderer.resolution) > 0 ? Number(renderer.resolution) : 1;
+    const width = Number(renderer.screen?.width ?? Number(renderer.width ?? renderer.view?.width) / resolution);
+    const height = Number(
+      renderer.screen?.height ?? Number(renderer.height ?? renderer.view?.height) / resolution,
+    );
+    if (!(width > 0 && height > 0)) return null;
+
+    return { width, height, renderer };
+  }
+
+  /**
+   * appがwindow.ezgをnull化した後も、代入時に捕捉した参照やPIXI経由の代替からGameを取得する。
+   * Rendererを持つ候補を優先する。
+   * @param {ShinyWindow} targetWindow
+   * @param {EzgApi | null} capturedEzg
+   * @param {EzgGame | null=} fallbackGame
+   * @returns {EzgGame | null}
+   */
+  function resolveGame(targetWindow, capturedEzg, fallbackGame = null) {
+    const candidates = [targetWindow.ezg?.game, capturedEzg?.game, fallbackGame];
+    return candidates.find((candidate) => candidate?.renderer) ?? candidates.find(Boolean) ?? null;
   }
 
   /**
@@ -660,15 +862,63 @@
    * @param {ShinyWindow} targetWindow
    * @param {EzgApi | null} capturedEzg
    * @param {EzgGame | null | undefined} game
+   * @param {PixiDisplayObject | null=} fallbackStage
    * @returns {PixiDisplayObject | null}
    */
-  function resolveStage(targetWindow, capturedEzg, game) {
+  function resolveStage(targetWindow, capturedEzg, game, fallbackStage = null) {
     return (
       targetWindow.ezg?.sceneManager?.stage ??
       capturedEzg?.sceneManager?.stage ??
       game?._sceneManager?.stage ??
+      fallbackStage ??
       null
     );
+  }
+
+  /**
+   * DevToolsを使えない端末向けに、診断情報を1行ずつの文字列へ整形する。
+   * @param {DiagnosticInfo} info
+   * @returns {string}
+   */
+  function formatDiagnostics(info) {
+    /**
+     * @param {[number, number] | null} size
+     * @returns {string}
+     */
+    const formatSize = (size) =>
+      size ? `${Math.round(size[0])}×${Math.round(size[1])}` : "取得できず";
+    const sourceLabel = { ezg: "ezg", pixi: "pixi", none: "未取得" }[info.source];
+
+    return [
+      `倍率: ${info.mode === "auto" ? "自動" : `${info.mode}x`} → ${info.scale ?? "-"}x`,
+      `Filter: ${info.filterMode === "sync" ? "連動" : `${info.filterMode}x`} → ${info.filterScale ?? "-"}x`,
+      `resolution: ${info.rendererResolution ?? "-"}`,
+      `論理: ${formatSize(info.logical)}`,
+      `描画: ${formatSize(info.backingStore)}`,
+      `CSS: ${formatSize(info.cssSize)}`,
+      `DPR: ${info.devicePixelRatio}`,
+      `取得経路: ${sourceLabel}`,
+    ].join("\n");
+  }
+
+  /**
+   * 端末上で状態を確認・復旧するためのメニューを登録する。
+   * iPhoneではDevToolsを使えないため、再適用と診断表示をメニューから行えるようにする。
+   * @param {{ apply: (force?: boolean) => ApplyResult | null, info: () => DiagnosticInfo }} runtime
+   * @param {(message: string) => void} showToast
+   * @param {((caption: string, onClick: () => void) => unknown) | undefined} registerMenuCommand
+   * @returns {void}
+   */
+  function registerActionMenu(runtime, showToast, registerMenuCommand) {
+    if (typeof registerMenuCommand !== "function") return;
+
+    registerMenuCommand("現在の設定を再適用", () => {
+      const result = runtime.apply(true);
+      showToast(result ? `再適用しました: ${result.scale}x` : "Rendererを取得できませんでした");
+    });
+    registerMenuCommand("診断情報を表示", () => {
+      showToast(formatDiagnostics(runtime.info()));
+    });
   }
 
   /**
@@ -685,6 +935,12 @@
     let filterMode = readFilterMode(targetWindow, api.GM_getValue);
     /** window.ezgがnull化される前に保持した参照。 @type {EzgApi | null} */
     let capturedEzg = null;
+    /** PIXIのrender経由で捕捉したRenderer。 @type {PixiRenderer | null} */
+    let capturedRenderer = null;
+    /** PIXIのrender経由で捕捉したシーン。 @type {PixiDisplayObject | null} */
+    let capturedStage = null;
+    /** PIXIフックを設置済みか。 @type {boolean} */
+    let pixiHookInstalled = false;
     /** 最後に成功した倍率適用結果。 @type {ApplyResult | null} */
     let lastResult = null;
     /** 画面遷移による再生成を検出するため、現在のRendererを保持する。 @type {PixiRenderer | null} */
@@ -729,10 +985,10 @@
      * @returns {ApplyResult | null}
      */
     const apply = (force = false) => {
-      const game = resolveGame(targetWindow, capturedEzg);
+      const game = resolveGame(targetWindow, capturedEzg, createFallbackGame(capturedRenderer));
       if (!game?.renderer) return null;
       activeRenderer = game.renderer;
-      const stage = resolveStage(targetWindow, capturedEzg, game);
+      const stage = resolveStage(targetWindow, capturedEzg, game, capturedStage);
       lastResult = applyGameScale(
         game,
         stage,
@@ -749,7 +1005,8 @@
      * @returns {void}
      */
     const observeCurrentRenderer = () => {
-      const renderer = resolveGame(targetWindow, capturedEzg)?.renderer;
+      const renderer = resolveGame(targetWindow, capturedEzg, createFallbackGame(capturedRenderer))
+        ?.renderer;
       if (!renderer?.view) return;
 
       if (renderer !== activeRenderer) {
@@ -770,12 +1027,34 @@
     };
 
     /**
+     * PIXIのrenderから捕捉したRendererとシーンを保存する。
+     * 毎フレーム呼ばれるため、Rendererが変わったときだけ適用処理へ進む。
+     * @param {PixiRenderer} renderer
+     * @param {PixiDisplayObject | null} stage
+     * @returns {void}
+     */
+    const captureFromPixi = (renderer, stage) => {
+      const changed = renderer !== capturedRenderer;
+      capturedRenderer = renderer;
+      if (stage) capturedStage = stage;
+      if (!changed) return;
+      // 描画中のresizeを避け、次のタスクで適用する。
+      targetWindow.setTimeout(() => {
+        observeCurrentRenderer();
+        apply(true);
+      }, 0);
+    };
+
+    /**
      * 現在の設定と描画サイズを診断用オブジェクトへまとめる。
      * @returns {DiagnosticInfo}
      */
     const info = () => {
-      const game = resolveGame(targetWindow, capturedEzg);
+      const ezgGame = targetWindow.ezg?.game ?? capturedEzg?.game ?? null;
+      const game = resolveGame(targetWindow, capturedEzg, createFallbackGame(capturedRenderer));
       const renderer = game?.renderer;
+      /** @type {RendererSource} */
+      const source = !renderer ? "none" : ezgGame?.renderer === renderer ? "ezg" : "pixi";
       return {
         mode,
         scale: lastResult?.scale ?? null,
@@ -788,6 +1067,7 @@
           ? [renderer.view.getBoundingClientRect().width, renderer.view.getBoundingClientRect().height]
           : null,
         devicePixelRatio: targetWindow.devicePixelRatio || 1,
+        source,
       };
     };
 
@@ -802,6 +1082,7 @@
 
       registerScaleMenu(targetWindow, mode, api.GM_setValue, api.GM_registerMenuCommand);
       registerFilterMenu(targetWindow, filterMode, api.GM_setValue, api.GM_registerMenuCommand);
+      registerActionMenu({ apply, info }, showToast, api.GM_registerMenuCommand);
       installEzgHook(targetWindow, (ezg) => {
         // ゲーム側はwindow.ezgを同期的にnull化するため、タイマーへ渡す前に参照を保持する。
         capturedEzg = ezg;
@@ -810,6 +1091,8 @@
           apply(true);
         }, 0);
       });
+      // ezgを取得できない環境（Stayのようにゲーム本体より後で実行される場合）の代替経路。
+      pixiHookInstalled = installPixiRendererHook(targetWindow, captureFromPixi);
 
       targetWindow.addEventListener("resize", () => targetWindow.setTimeout(() => apply(false), 250));
       targetWindow.addEventListener("orientationchange", () => targetWindow.setTimeout(() => apply(true), 400));
@@ -838,6 +1121,8 @@
         true,
       );
       targetWindow.setInterval(() => {
+        // PIXIの読み込みが後の環境向けに、設置できるまでフックを試し続ける。
+        if (!pixiHookInstalled) pixiHookInstalled = installPixiRendererHook(targetWindow, captureFromPixi);
         observeCurrentRenderer();
         apply(false);
       }, 1000);
@@ -854,6 +1139,9 @@
         },
         get filterScale() {
           return lastResult?.filterScale ?? null;
+        },
+        get source() {
+          return info().source;
         },
         apply: () => apply(true),
         info,
@@ -900,11 +1188,16 @@
       applyGameScale,
       applyRendererScale,
       clampScale,
+      collectRenderPrototypes,
       computeAutoScale,
+      createFallbackGame,
       createUpscalerRuntime,
+      findPixiNamespaces,
+      formatDiagnostics,
       getGpuScaleLimit,
       // isFilterHotkey,
       installEzgHook,
+      installPixiRendererHook,
       isUpscalerHotkey,
       // nextFilterMode,
       nextMode,
@@ -912,6 +1205,7 @@
       normalizeMode,
       readFilterMode,
       readMode,
+      registerActionMenu,
       registerFilterMenu,
       registerScaleMenu,
       resolveFilterScale,

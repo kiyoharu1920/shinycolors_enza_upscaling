@@ -8,16 +8,22 @@ const vm = require("node:vm");
 const {
   applyGameScale,
   applyRendererScale,
+  collectRenderPrototypes,
   computeAutoScale,
+  createFallbackGame,
   createUpscalerRuntime,
+  findPixiNamespaces,
+  formatDiagnostics,
   getGpuScaleLimit,
   installEzgHook,
+  installPixiRendererHook,
   isUpscalerHotkey,
   nextMode,
   normalizeFilterMode,
   normalizeMode,
   readFilterMode,
   readMode,
+  registerActionMenu,
   registerFilterMenu,
   registerScaleMenu,
   resolveFilterScale,
@@ -443,7 +449,7 @@ test("ブラウザ読込時はunsafeWindowを選びruntimeを自動起動する"
   assert.equal(pageHarness.countListeners("orientationchange"), 1);
   assert.equal(pageHarness.countListeners("keydown"), 1);
   assert.equal(pageHarness.countIntervals(1000), 1);
-  assert.equal(menuCommands.length, 13);
+  assert.equal(menuCommands.length, 15);
   assert.match(menuCommands[0].caption, /Alt\+U/);
   assert.match(menuCommands[7].caption, /Canvas倍率に連動/);
 
@@ -486,7 +492,7 @@ test("Stayがレキシカルに注入するGM APIで設定メニューを登録�
   );
 
   assert.equal(pageHarness.targetWindow.__shinyColorsUpscaler.mode, 3);
-  assert.equal(menuCommands.length, 13);
+  assert.equal(menuCommands.length, 15);
   assert.match(menuCommands[0].caption, /Alt\+U/);
   menuCommands.find(({ caption }) => caption.includes("Canvas描画倍率 4x")).onClick();
   assert.deepEqual(storedValues, [["canvas-render-scale", 4]]);
@@ -512,7 +518,7 @@ test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供�
   harness.targetWindow.ezg = null;
   harness.runTimeouts(0);
 
-  assert.equal(menuCommands.length, 13);
+  assert.equal(menuCommands.length, 15);
   assert.equal(harness.countListeners("keydown"), 1);
   assert.equal(renderer.resolution, 2);
   assert.equal(renderer.rootRenderTarget.resolution, 2);
@@ -534,6 +540,7 @@ test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供�
     backingStore: [2272, 1280],
     cssSize: [1136, 640],
     devicePixelRatio: 1,
+    source: "ezg",
   });
 
   renderer.resolution = 1;
@@ -645,4 +652,255 @@ test("isUpscalerHotkeyは修飾なしのAlt+Uだけを受け付ける", () => {
   assert.equal(isUpscalerHotkey({ ...event, repeat: true }), false);
   assert.equal(isUpscalerHotkey({ ...event, ctrlKey: true }), false);
   assert.equal(isUpscalerHotkey({ ...event, key: "x", code: "KeyX" }), false);
+});
+
+test("installEzgHookはnull化済みプロパティでも再代入を捕捉する", () => {
+  const targetWindow = {};
+  // ゲーム側が代入してからnull化した後の状態を再現する。
+  targetWindow.ezg = { game: {} };
+  targetWindow.ezg = null;
+
+  const captured = [];
+  assert.equal(installEzgHook(targetWindow, (value) => captured.push(value)), true);
+  assert.equal(captured.length, 0);
+
+  // null化の再代入では通知せず、監視を続ける。
+  targetWindow.ezg = null;
+  assert.equal(captured.length, 0);
+
+  const ezg = { game: { width: 1136, height: 640 } };
+  targetWindow.ezg = ezg;
+
+  assert.deepEqual(captured, [ezg]);
+  assert.equal(targetWindow.ezg, ezg);
+  assert.equal(Object.getOwnPropertyDescriptor(targetWindow, "ezg").writable, true);
+});
+
+test("installEzgHookは再定義できないezgプロパティでは諦める", () => {
+  const targetWindow = {};
+  Object.defineProperty(targetWindow, "ezg", { configurable: false, writable: true, value: null });
+
+  assert.equal(installEzgHook(targetWindow, () => {}), false);
+});
+
+test("findPixiNamespacesはPIXIを優先し、別名も探し、getterは読まない", () => {
+  class Renderer {}
+  const pixi = { Renderer };
+  const aliased = { CanvasRenderer: Renderer };
+  let getterCalls = 0;
+  const targetWindow = { PIXI: pixi, aliased, unrelated: { draw: () => {} } };
+  Object.defineProperty(targetWindow, "lazy", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return { Renderer };
+    },
+  });
+  Object.defineProperty(targetWindow, "explodes", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      throw new Error("boom");
+    },
+  });
+
+  assert.deepEqual(findPixiNamespaces(targetWindow), [pixi, aliased]);
+  assert.equal(getterCalls, 0);
+});
+
+test("collectRenderPrototypesは継承したrenderと重複実装を除外する", () => {
+  class Base {
+    render() {}
+  }
+  class Derived extends Base {}
+  const sharedRender = function () {};
+  const First = function () {};
+  First.prototype.render = sharedRender;
+  const Second = function () {};
+  Second.prototype.render = sharedRender;
+
+  assert.deepEqual(collectRenderPrototypes([{ Renderer: Base, WebGLRenderer: Derived }]), [
+    Base.prototype,
+  ]);
+  assert.deepEqual(collectRenderPrototypes([{ Renderer: First, CanvasRenderer: Second }]), [
+    First.prototype,
+  ]);
+  assert.deepEqual(collectRenderPrototypes([{ Renderer: 1, SystemRenderer: undefined }]), []);
+});
+
+test("installPixiRendererHookはRendererとシーンを捕捉し、RenderTexture描画は無視する", () => {
+  const originalCalls = [];
+  class Renderer {
+    render(displayObject, renderTexture) {
+      originalCalls.push([displayObject, renderTexture]);
+    }
+  }
+  const targetWindow = { PIXI: { Renderer } };
+  const captures = [];
+
+  assert.equal(
+    installPixiRendererHook(targetWindow, (renderer, stage) => captures.push([renderer, stage])),
+    true,
+  );
+  // 二重に包まない。
+  assert.equal(installPixiRendererHook(targetWindow, () => captures.push(["second"])), true);
+
+  const renderer = createRenderer();
+  const stage = { filters: [], children: [] };
+  const offscreen = createRenderer();
+  offscreen.view.isConnected = false;
+
+  Renderer.prototype.render.call(renderer, stage);
+  Renderer.prototype.render.call(renderer, stage, { baseTexture: {} });
+  Renderer.prototype.render.call(offscreen, stage);
+
+  assert.equal(captures.length, 1);
+  assert.deepEqual(captures[0], [renderer, stage]);
+  // 元のrenderは常に呼ばれる。
+  assert.equal(originalCalls.length, 3);
+});
+
+test("installPixiRendererHookは捕捉処理が例外を投げても描画を止めない", () => {
+  let rendered = 0;
+  class Renderer {
+    render() {
+      rendered += 1;
+    }
+  }
+  const targetWindow = { PIXI: { Renderer } };
+  installPixiRendererHook(targetWindow, () => {
+    throw new Error("boom");
+  });
+
+  Renderer.prototype.render.call(createRenderer(), { filters: [], children: [] });
+  assert.equal(rendered, 1);
+});
+
+test("createFallbackGameはscreenまたはresolutionから論理サイズを組み立てる", () => {
+  const renderer = createRenderer();
+  renderer.screen = { width: 1136, height: 640 };
+  assert.deepEqual(createFallbackGame(renderer), { width: 1136, height: 640, renderer });
+
+  const scaled = createRenderer();
+  scaled.resolution = 2;
+  scaled.view.width = 2272;
+  scaled.view.height = 1280;
+  assert.deepEqual(createFallbackGame(scaled), { width: 1136, height: 640, renderer: scaled });
+
+  assert.equal(createFallbackGame(null), null);
+});
+
+test("resolveGameとresolveStageはRendererを持つ候補と代替シーンを使う", () => {
+  const renderer = createRenderer();
+  const fallbackGame = { width: 1136, height: 640, renderer };
+  const bareGame = { width: 1136, height: 640 };
+  const fallbackStage = { filters: [], children: [] };
+
+  assert.equal(resolveGame({ ezg: { game: bareGame } }, null, fallbackGame), fallbackGame);
+  assert.equal(resolveGame({}, null, null), null);
+  assert.equal(resolveStage({}, null, null, fallbackStage), fallbackStage);
+});
+
+test("formatDiagnosticsは取得経路と描画サイズを含む要約を返す", () => {
+  const info = {
+    mode: "auto",
+    scale: 2,
+    filterMode: "sync",
+    filterScale: 2,
+    rendererResolution: 2,
+    logical: [1136, 640],
+    backingStore: [2272, 1280],
+    cssSize: [390, 220],
+    devicePixelRatio: 3,
+    source: "pixi",
+  };
+
+  const text = formatDiagnostics(info);
+  assert.match(text, /倍率: 自動 → 2x/);
+  assert.match(text, /Filter: 連動 → 2x/);
+  assert.match(text, /描画: 2272×1280/);
+  assert.match(text, /DPR: 3/);
+  assert.match(text, /取得経路: pixi/);
+
+  const missing = formatDiagnostics({ ...info, backingStore: null, source: "none" });
+  assert.match(missing, /描画: 取得できず/);
+  assert.match(missing, /取得経路: 未取得/);
+});
+
+test("registerActionMenuは再適用と診断表示を登録する", () => {
+  const commands = [];
+  const toasts = [];
+  const forceValues = [];
+  const info = {
+    mode: 2,
+    scale: 2,
+    filterMode: "sync",
+    filterScale: 2,
+    rendererResolution: 2,
+    logical: [1136, 640],
+    backingStore: [2272, 1280],
+    cssSize: [390, 220],
+    devicePixelRatio: 3,
+    source: "ezg",
+  };
+
+  registerActionMenu(
+    {
+      apply: (force) => {
+        forceValues.push(force);
+        return forceValues.length === 1 ? { scale: 3 } : null;
+      },
+      info: () => info,
+    },
+    (message) => toasts.push(message),
+    (caption, onClick) => commands.push({ caption, onClick }),
+  );
+
+  assert.equal(commands.length, 2);
+  commands[0].onClick();
+  assert.deepEqual(forceValues, [true]);
+  assert.match(toasts[0], /再適用しました: 3x/);
+
+  commands[1].onClick();
+  assert.match(toasts[1], /取得経路: ezg/);
+
+  commands[0].onClick();
+  assert.match(toasts[2], /Rendererを取得できませんでした/);
+});
+
+test("ezgを取得できない環境でもPIXI経由で倍率を適用する", () => {
+  const harness = createWindowHarness();
+  const renderer = createRenderer();
+  renderer.screen = { width: 1136, height: 640 };
+  const filter = { resolution: 1 };
+  const stage = { filters: [filter], children: [] };
+  let rendered = 0;
+  class Renderer {
+    render() {
+      rendered += 1;
+    }
+  }
+  harness.targetWindow.PIXI = { Renderer };
+  // Stayのようにゲーム本体より後で実行され、ezgが既にnull化済みの状態。
+  harness.targetWindow.ezg = null;
+
+  const runtime = createUpscalerRuntime(harness.targetWindow, {
+    GM_getValue: (key, fallback) => (key === "canvas-render-scale" ? 2 : fallback),
+    GM_setValue: () => {},
+    GM_registerMenuCommand: () => {},
+  });
+  runtime.start();
+  assert.equal(runtime.info().source, "none");
+
+  Renderer.prototype.render.call(renderer, stage);
+  harness.runTimeouts(0);
+
+  assert.equal(rendered, 1);
+  assert.equal(renderer.resolution, 2);
+  assert.equal(renderer.view.width, 2272);
+  assert.equal(renderer.view.height, 1280);
+  assert.equal(filter.resolution, 2);
+  assert.equal(runtime.info().source, "pixi");
+  assert.deepEqual(runtime.info().logical, [1136, 640]);
 });
