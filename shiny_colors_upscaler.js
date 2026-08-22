@@ -153,6 +153,8 @@
   const DEFAULT_MODE = 2;
   /** Filter解像度の既定値。 @type {FilterMode} */
   const DEFAULT_FILTER_MODE = 2;
+  /** 画面左下トーストを表示し続けるミリ秒。診断情報を読み切れる長さにする。 @type {number} */
+  const TOAST_DURATION_MS = 3000;
   /** PIXI名前空間から探すRendererコンストラクタ名。 @type {readonly string[]} */
   const RENDERER_CTOR_NAMES = Object.freeze([
     "Renderer",
@@ -957,7 +959,7 @@
     let started = false;
 
     /**
-     * ホットキー変更結果を画面左下へ短時間表示する。
+     * ホットキー変更結果や診断情報を画面左下へ一定時間表示する。
      * @param {string} message
      * @returns {void}
      */
@@ -976,7 +978,7 @@
       targetWindow.clearTimeout(toastTimer);
       toastTimer = targetWindow.setTimeout(() => {
         if (toastElement) toastElement.style.opacity = "0";
-      }, 1800);
+      }, TOAST_DURATION_MS);
     };
 
     /**
