@@ -12,6 +12,7 @@ const {
   computeAutoScale,
   createFallbackGame,
   createUpscalerRuntime,
+  findDomCanvas,
   findPixiNamespaces,
   formatDiagnostics,
   getGpuScaleLimit,
@@ -541,6 +542,14 @@ test("runtimeはezg捕捉後にRenderer監視と診断APIを一括して提供�
     cssSize: [1136, 640],
     devicePixelRatio: 1,
     source: "ezg",
+    // ゲーム側がwindow.ezgをnull化した後でも、捕捉済み参照で"ezg"経路を維持できている。
+    unsafeWindowGranted: false,
+    ezgVisible: false,
+    pixiVisible: false,
+    pixiNamespaceCount: 0,
+    pixiHookInstalled: false,
+    domCanvasBackingStore: null,
+    domCanvasCssSize: null,
   });
 
   renderer.resolution = 1;
@@ -814,6 +823,13 @@ test("formatDiagnosticsは取得経路と描画サイズを含む要約を返す
     cssSize: [390, 220],
     devicePixelRatio: 3,
     source: "pixi",
+    unsafeWindowGranted: true,
+    ezgVisible: true,
+    pixiVisible: true,
+    pixiNamespaceCount: 1,
+    pixiHookInstalled: true,
+    domCanvasBackingStore: [2272, 1280],
+    domCanvasCssSize: [390, 220],
   };
 
   const text = formatDiagnostics(info);
@@ -822,10 +838,62 @@ test("formatDiagnosticsは取得経路と描画サイズを含む要約を返す
   assert.match(text, /描画: 2272×1280/);
   assert.match(text, /DPR: 3/);
   assert.match(text, /取得経路: pixi/);
+  assert.match(text, /unsafeWindow: あり/);
+  assert.match(text, /ページ変数: ezg=見える PIXI=見える 候補=1/);
+  assert.match(text, /PIXIフック: 設置済み/);
+  assert.match(text, /DOM Canvas: 2272×1280 \/ CSS 390×220/);
 
   const missing = formatDiagnostics({ ...info, backingStore: null, source: "none" });
   assert.match(missing, /描画: 取得できず/);
   assert.match(missing, /取得経路: 未取得/);
+});
+
+test("formatDiagnosticsは隔離コンテキストの兆候を区別できる", () => {
+  // ページ変数が見えないのにDOM上のCanvasは見える＝隔離コンテキストで実行されている状態。
+  const isolated = formatDiagnostics({
+    mode: 4,
+    scale: null,
+    filterMode: 2,
+    filterScale: null,
+    rendererResolution: null,
+    logical: null,
+    backingStore: null,
+    cssSize: null,
+    devicePixelRatio: 2,
+    source: "none",
+    unsafeWindowGranted: true,
+    ezgVisible: false,
+    pixiVisible: false,
+    pixiNamespaceCount: 0,
+    pixiHookInstalled: false,
+    domCanvasBackingStore: [1136, 640],
+    domCanvasCssSize: [1194, 673],
+  });
+
+  assert.match(isolated, /取得経路: 未取得/);
+  assert.match(isolated, /ページ変数: ezg=見えない PIXI=見えない 候補=0/);
+  assert.match(isolated, /PIXIフック: 未設置/);
+  assert.match(isolated, /DOM Canvas: 1136×640 \/ CSS 1194×673/);
+});
+
+test("findDomCanvasは最大面積のCanvasを返す", () => {
+  const createCanvas = (width, height, cssWidth, cssHeight) => ({
+    width,
+    height,
+    getBoundingClientRect: () => ({ width: cssWidth, height: cssHeight }),
+  });
+  const targetWindow = {
+    document: {
+      querySelectorAll: () => [createCanvas(16, 16, 8, 8), createCanvas(1136, 640, 1194, 673)],
+    },
+  };
+
+  assert.deepEqual(findDomCanvas(targetWindow), {
+    backingStore: [1136, 640],
+    cssSize: [1194, 673],
+  });
+  assert.equal(findDomCanvas({ document: { querySelectorAll: () => [] } }), null);
+  assert.equal(findDomCanvas({}), null);
 });
 
 test("registerActionMenuは再適用と診断表示を登録する", () => {
@@ -843,6 +911,13 @@ test("registerActionMenuは再適用と診断表示を登録する", () => {
     cssSize: [390, 220],
     devicePixelRatio: 3,
     source: "ezg",
+    unsafeWindowGranted: true,
+    ezgVisible: true,
+    pixiVisible: true,
+    pixiNamespaceCount: 1,
+    pixiHookInstalled: true,
+    domCanvasBackingStore: [2272, 1280],
+    domCanvasCssSize: [390, 220],
   };
 
   registerActionMenu(

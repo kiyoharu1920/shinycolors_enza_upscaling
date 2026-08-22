@@ -2,7 +2,7 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.6.0
+// @version      2.6.1
 // @description  Shiny ColorsのCanvasを高解像度化します。
 // @description:en Upscales the Canvas of Shiny Colors.
 // @license      MIT
@@ -125,6 +125,13 @@
    * @property {[number, number] | null} cssSize
    * @property {number} devicePixelRatio
    * @property {RendererSource} source
+   * @property {boolean} unsafeWindowGranted
+   * @property {boolean} ezgVisible
+   * @property {boolean} pixiVisible
+   * @property {number} pixiNamespaceCount
+   * @property {boolean} pixiHookInstalled
+   * @property {[number, number] | null} domCanvasBackingStore
+   * @property {[number, number] | null} domCanvasCssSize
    */
 
   /**
@@ -878,6 +885,35 @@
   }
 
   /**
+   * ページのDOMから最大面積のCanvasを探す。
+   * 隔離コンテキストで実行されてもDOMだけは共有されるため、
+   * 「ページ変数が見えないのか」「Canvas自体が無いのか」を切り分ける材料にする。
+   * @param {ShinyWindow} targetWindow
+   * @returns {{ backingStore: [number, number], cssSize: [number, number] } | null}
+   */
+  function findDomCanvas(targetWindow) {
+    /** @type {HTMLCanvasElement | null} */
+    let largest = null;
+    try {
+      const canvases = targetWindow.document?.querySelectorAll?.("canvas");
+      if (!canvases) return null;
+      for (const canvas of /** @type {Iterable<HTMLCanvasElement>} */ (canvases)) {
+        if (!largest || canvas.width * canvas.height > largest.width * largest.height) largest = canvas;
+      }
+    } catch (error) {
+      console.warn(`${LOG_PREFIX} DOMからCanvasを探せませんでした。`, error);
+      return null;
+    }
+    if (!largest) return null;
+
+    const rect = largest.getBoundingClientRect();
+    return {
+      backingStore: [largest.width, largest.height],
+      cssSize: [rect.width, rect.height],
+    };
+  }
+
+  /**
    * DevToolsを使えない端末向けに、診断情報を1行ずつの文字列へ整形する。
    * @param {DiagnosticInfo} info
    * @returns {string}
@@ -900,6 +936,11 @@
       `CSS: ${formatSize(info.cssSize)}`,
       `DPR: ${info.devicePixelRatio}`,
       `取得経路: ${sourceLabel}`,
+      `unsafeWindow: ${info.unsafeWindowGranted ? "あり" : "なし"}`,
+      `ページ変数: ezg=${info.ezgVisible ? "見える" : "見えない"} ` +
+        `PIXI=${info.pixiVisible ? "見える" : "見えない"} 候補=${info.pixiNamespaceCount}`,
+      `PIXIフック: ${info.pixiHookInstalled ? "設置済み" : "未設置"}`,
+      `DOM Canvas: ${formatSize(info.domCanvasBackingStore)} / CSS ${formatSize(info.domCanvasCssSize)}`,
     ].join("\n");
   }
 
@@ -970,7 +1011,7 @@
         toastElement.style.cssText =
           "position:fixed;left:8px;bottom:8px;z-index:2147483647;padding:6px 10px;" +
           "background:rgba(0,0,0,.72);color:#fff;font:12px/1.4 sans-serif;" +
-          "border-radius:4px;pointer-events:none;transition:opacity .3s;";
+          "border-radius:4px;pointer-events:none;transition:opacity .3s;white-space:pre-line;";
         targetWindow.document.body.appendChild(toastElement);
       }
       toastElement.textContent = message;
@@ -1052,6 +1093,7 @@
      * @returns {DiagnosticInfo}
      */
     const info = () => {
+      const domCanvas = findDomCanvas(targetWindow);
       const ezgGame = targetWindow.ezg?.game ?? capturedEzg?.game ?? null;
       const game = resolveGame(targetWindow, capturedEzg, createFallbackGame(capturedRenderer));
       const renderer = game?.renderer;
@@ -1070,6 +1112,13 @@
           : null,
         devicePixelRatio: targetWindow.devicePixelRatio || 1,
         source,
+        unsafeWindowGranted: !!api.unsafeWindow,
+        ezgVisible: !!targetWindow.ezg,
+        pixiVisible: !!targetWindow.PIXI,
+        pixiNamespaceCount: findPixiNamespaces(targetWindow).length,
+        pixiHookInstalled,
+        domCanvasBackingStore: domCanvas?.backingStore ?? null,
+        domCanvasCssSize: domCanvas?.cssSize ?? null,
       };
     };
 
@@ -1194,6 +1243,7 @@
       computeAutoScale,
       createFallbackGame,
       createUpscalerRuntime,
+      findDomCanvas,
       findPixiNamespaces,
       formatDiagnostics,
       getGpuScaleLimit,
