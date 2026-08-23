@@ -16,10 +16,6 @@ npm-debug.log*
 # Claude Codeのローカル設定
 .claude/settings.local.json
 
-# AIエージェント向けのローカルメモ（共有しない）
-CLAUDE.md
-AGENT.md
-
 # ログ・一時ファイル
 *.log
 *.tmp
