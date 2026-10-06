@@ -17,6 +17,7 @@ const {
   formatDiagnostics,
   getGpuScaleLimit,
   installEzgHook,
+  installPixiAssignmentHook,
   installPixiRendererHook,
   isUpscalerHotkey,
   nextMode,
@@ -104,7 +105,10 @@ function createWindowHarness() {
           appendedElements.push(element);
         },
       },
-      createElement: () => ({ style: {}, textContent: "" }),
+      createElement: () => ({
+        style: {}, textContent: "", attributes: {},
+        setAttribute(name, value) { this.attributes[name] = value; },
+      }),
     },
     localStorage: {
       getItem: () => null,
@@ -617,7 +621,8 @@ test("runtimeはAlt+Uと画面変化を同じ倍率適用処理へ集約する",
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.mode, 3);
   assert.equal(harness.targetWindow.__shinyColorsUpscaler.scale, 3);
   assert.equal(filter.resolution, 2);
-  assert.equal(harness.appendedElements[0].textContent, "Canvas描画倍率: 3x");
+  assert.equal(harness.appendedElements[0].textContent, "描画倍率：3倍\n実際：3倍（3408 × 1920px）");
+  assert.equal(harness.appendedElements[0].attributes["role"], "status");
 
   renderer.resolution = 1;
   renderer.rootRenderTarget.resolution = 1;
@@ -718,7 +723,7 @@ test("findPixiNamespacesはPIXIを優先し、別名も探し、getterは読ま�
   assert.equal(getterCalls, 0);
 });
 
-test("collectRenderPrototypesは継承したrenderと重複実装を除外する", () => {
+test("collectRenderPrototypesは継承したrenderを除外し別prototypeの共有実装は両方残す", () => {
   class Base {
     render() {}
   }
@@ -734,6 +739,7 @@ test("collectRenderPrototypesは継承したrenderと重複実装を除外する
   ]);
   assert.deepEqual(collectRenderPrototypes([{ Renderer: First, CanvasRenderer: Second }]), [
     First.prototype,
+    Second.prototype,
   ]);
   assert.deepEqual(collectRenderPrototypes([{ Renderer: 1, SystemRenderer: undefined }]), []);
 });
@@ -924,7 +930,8 @@ test("registerActionMenuは再適用と診断表示を登録する", () => {
     {
       apply: (force) => {
         forceValues.push(force);
-        return forceValues.length === 1 ? { scale: 3 } : null;
+        return forceValues.length === 1
+          ? { applied: true, scale: 3, logical: [1136, 640], backingStore: [3408, 1920] } : null;
       },
       info: () => info,
     },
@@ -935,13 +942,13 @@ test("registerActionMenuは再適用と診断表示を登録する", () => {
   assert.equal(commands.length, 2);
   commands[0].onClick();
   assert.deepEqual(forceValues, [true]);
-  assert.match(toasts[0], /再適用しました: 3x/);
+  assert.match(toasts[0], /実際：3倍（3408 × 1920px）/);
 
   commands[1].onClick();
   assert.match(toasts[1], /取得経路: ezg/);
 
   commands[0].onClick();
-  assert.match(toasts[2], /Rendererを取得できませんでした/);
+  assert.match(toasts[2], /描画倍率を適用できません/);
 });
 
 test("ezgを取得できない環境でもPIXI経由で倍率を適用する", () => {
@@ -978,4 +985,269 @@ test("ezgを取得できない環境でもPIXI経由で倍率を適用する", (
   assert.equal(filter.resolution, 2);
   assert.equal(runtime.info().source, "pixi");
   assert.deepEqual(runtime.info().logical, [1136, 640]);
+});
+
+test("PIXIが同一タスク内で上書きされても最初のコピーからRendererを捕捉する", () => {
+  const harness = createWindowHarness();
+  const runtime = createUpscalerRuntime(harness.targetWindow, {});
+  runtime.start();
+  class First { render() { return "first"; } }
+  class Second { render() { return "second"; } }
+  harness.targetWindow.PIXI = { Renderer: First };
+  harness.targetWindow.PIXI = { Renderer: Second };
+  const renderer = createRenderer();
+  renderer.screen = { width: 1136, height: 640 };
+  assert.equal(First.prototype.render.call(renderer, {}), "first");
+  harness.runTimeouts(0);
+  assert.equal(renderer.resolution, 2);
+  assert.equal(renderer.resizeCalls, 1);
+  assert.equal(runtime.info().source, "pixi");
+  assert.equal(Second.prototype.render.call(renderer, {}), "second");
+  harness.runTimeouts(0);
+  assert.equal(renderer.resizeCalls, 1);
+});
+
+test("runtimeはフック設置後も新たな別名PIXIとrenderの再定義を追跡する", () => {
+  const harness = createWindowHarness();
+  class First { render() {} }
+  class Later { render() { return 42; } }
+  harness.targetWindow.PIXI = { Renderer: First };
+  const runtime = createUpscalerRuntime(harness.targetWindow, {});
+  runtime.start();
+  harness.targetWindow.pixiAlias = { Renderer: Later };
+  harness.runIntervals(1000);
+  const renderer = createRenderer();
+  renderer.screen = { width: 1136, height: 640 };
+  assert.equal(Later.prototype.render.call(renderer, {}), 42);
+  harness.runTimeouts(0);
+  assert.equal(renderer.resolution, 2);
+  Later.prototype.render = function () { return 43; };
+  const replacement = createRenderer();
+  replacement.screen = { width: 1136, height: 640 };
+  renderer.view.isConnected = false;
+  harness.runIntervals(1000);
+  assert.equal(Later.prototype.render.call(replacement, {}), 43);
+  harness.runTimeouts(0);
+  assert.equal(replacement.resolution, 2);
+});
+
+test("PIXI代入フックは既存accessorの受信者と値変換を維持する", () => {
+  const targetWindow = {};
+  let stored;
+  let writes = 0;
+  Object.defineProperty(targetWindow, "PIXI", {
+    configurable: true, enumerable: false,
+    get() { assert.equal(this, targetWindow); return stored; },
+    set(value) { assert.equal(this, targetWindow); writes += 1; stored = value.actual; },
+  });
+  const captured = [];
+  assert.equal(installPixiAssignmentHook(targetWindow, (ns) => captured.push(ns)), true);
+  const first = {};
+  const second = {};
+  targetWindow.PIXI = { actual: first };
+  targetWindow.PIXI = { actual: second };
+  assert.equal(targetWindow.PIXI, second);
+  assert.deepEqual(captured, [first, second]);
+  assert.equal(writes, 2);
+  assert.equal(Object.getOwnPropertyDescriptor(targetWindow, "PIXI").enumerable, false);
+});
+
+test("PIXI代入フックは読み取り専用・再定義不可のプロパティを変更しない", () => {
+  for (const descriptor of [
+    { configurable: false, writable: true, value: {} },
+    { configurable: true, writable: false, value: {} },
+    { configurable: true, get: () => ({}) },
+  ]) {
+    const targetWindow = {};
+    Object.defineProperty(targetWindow, "PIXI", descriptor);
+    const before = Object.getOwnPropertyDescriptor(targetWindow, "PIXI");
+    let captures = 0;
+    assert.equal(installPixiAssignmentHook(targetWindow, () => { captures += 1; }), false);
+    assert.equal(captures, 1);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(targetWindow, "PIXI"), before);
+  }
+});
+
+test("PIXI代入フックの通知失敗は代入を止めず後続値も通知する", (context) => {
+  context.mock.method(console, "warn", () => {});
+  const targetWindow = {};
+  let calls = 0;
+  installPixiAssignmentHook(targetWindow, () => { calls += 1; throw new Error("capture failed"); });
+  const first = {};
+  const second = {};
+  targetWindow.PIXI = first;
+  assert.equal(targetWindow.PIXI, first);
+  targetWindow.PIXI = second;
+  assert.equal(targetWindow.PIXI, second);
+  assert.equal(calls, 2);
+  assert.equal(console.warn.mock.callCount(), 2);
+});
+
+test("共有renderの別prototypeと基底クラスを持つ独自renderをそれぞれフックする", () => {
+  const shared = function () { return 10; };
+  class Base {}
+  Base.prototype.render = shared;
+  class Derived extends Base {}
+  Derived.prototype.render = shared;
+  const targetWindow = { PIXI: { Renderer: Base, WebGLRenderer: Derived, CanvasRenderer: Base } };
+  let captures = 0;
+  installPixiRendererHook(targetWindow, () => { captures += 1; });
+  const first = Base.prototype.render;
+  const second = Derived.prototype.render;
+  installPixiRendererHook(targetWindow, () => { throw new Error("duplicate"); });
+  assert.equal(Base.prototype.render, first);
+  assert.equal(Derived.prototype.render, second);
+  assert.equal(Base.prototype.render.call(createRenderer()), 10);
+  assert.equal(Derived.prototype.render.call(createRenderer()), 10);
+  assert.equal(captures, 2);
+});
+
+test("倍率適用と復元resizeが両方失敗してもCSSを復元する", (context) => {
+  context.mock.method(console, "warn", () => {});
+  context.mock.method(console, "error", () => {});
+  const renderer = createRenderer();
+  renderer.resize = function () {
+    this.view.style.width = "broken";
+    this.view.style.height = "broken";
+    throw new Error("resize failed");
+  };
+  assert.equal(applyRendererScale({ width: 1136, height: 640, renderer }, 2, 1), null);
+  assert.equal(renderer.resolution, 1);
+  assert.equal(renderer.rootRenderTarget.resolution, 1);
+  assert.equal(renderer.plugins.interaction.resolution, 1);
+  assert.deepEqual(renderer.view.style, { width: "80vw", height: "auto" });
+  assert.equal(console.error.mock.callCount(), 1);
+});
+
+test("runtimeはCanvasがAからBへ変わりAへ戻ってもサイズ監視を再接続する", () => {
+  const harness = createWindowHarness();
+  const first = createRenderer();
+  const second = createRenderer();
+  const game = { width: 1136, height: 640, renderer: first };
+  harness.targetWindow.ezg = { game };
+  createUpscalerRuntime(harness.targetWindow, {}).start();
+  harness.runTimeouts(0);
+  assert.equal(first.resizeCalls, 1);
+  game.renderer = second;
+  harness.runIntervals(1000);
+  game.renderer = first;
+  harness.runIntervals(1000);
+  assert.equal(harness.resizeObservers.length, 3);
+  assert.equal(harness.resizeObservers[0].disconnected, true);
+  assert.equal(harness.resizeObservers[1].disconnected, true);
+  assert.equal(harness.resizeObservers[2].observed, first.view);
+  first.resolution = 1;
+  harness.resizeObservers[2].callback();
+  assert.equal(first.resolution, 2);
+  const before = first.resizeCalls;
+  first.view.dispatch("webglcontextrestored");
+  assert.equal(first.resizeCalls, before + 1);
+});
+
+test("切断済みezg Rendererを避けPIXIのRendererと対応するシーンへ適用する", () => {
+  const harness = createWindowHarness();
+  const oldRenderer = createRenderer();
+  const oldFilter = { resolution: 1 };
+  harness.targetWindow.ezg = {
+    game: { width: 1136, height: 640, renderer: oldRenderer },
+    sceneManager: { stage: { filters: [oldFilter] } },
+  };
+  class Renderer { render() {} }
+  harness.targetWindow.PIXI = { Renderer };
+  const runtime = createUpscalerRuntime(harness.targetWindow, {});
+  runtime.start();
+  harness.runTimeouts(0);
+  oldFilter.resolution = 1;
+  oldRenderer.view.isConnected = false;
+  const renderer = createRenderer();
+  renderer.screen = { width: 1136, height: 640 };
+  const newFilter = { resolution: 1 };
+  Renderer.prototype.render.call(renderer, { filters: [newFilter] });
+  harness.runTimeouts(0);
+  assert.equal(renderer.resolution, 2);
+  assert.equal(newFilter.resolution, 2);
+  assert.equal(oldFilter.resolution, 1);
+  assert.equal(runtime.info().source, "pixi");
+  renderer.view.isConnected = false;
+  harness.runIntervals(1000);
+  assert.equal(runtime.info().source, "none");
+  assert.equal(runtime.info().scale, null);
+  assert.equal(harness.resizeObservers.at(-1).disconnected, true);
+});
+
+test("GPU上限が1x未満でも描画サイズを上限へ収める", () => {
+  const renderer = createRenderer({ logicalWidth: 5000, logicalHeight: 3000 });
+  renderer.gl = {
+    MAX_TEXTURE_SIZE: 1, MAX_RENDERBUFFER_SIZE: 2, MAX_VIEWPORT_DIMS: 3,
+    getParameter: (parameter) => parameter === 3 ? [4096, 4096] : 4096,
+  };
+  const result = applyRendererScale({ width: 5000, height: 3000, renderer }, 2, 1);
+  assert.equal(result.scale, 4096 / 5000);
+  assert.equal(renderer.view.width, 4096);
+  assert.ok(renderer.view.height <= 4096);
+});
+
+test("無限大の論理サイズではresizeを実行しない", () => {
+  const renderer = createRenderer();
+  assert.equal(applyRendererScale({ width: Infinity, height: 640, renderer }, 2, 1), null);
+  assert.equal(renderer.resizeCalls, 0);
+  renderer.screen = { width: Infinity, height: 640 };
+  assert.equal(createFallbackGame(renderer), null);
+});
+
+
+test("PIXIの代入を監視できなくても定期走査で後続コピーを取得する", () => {
+  const harness = createWindowHarness();
+  class First { render() {} }
+  class Second { render() {} }
+  Object.defineProperty(harness.targetWindow, "PIXI", {
+    configurable: false, writable: true, value: { Renderer: First },
+  });
+  const runtime = createUpscalerRuntime(harness.targetWindow, {});
+  runtime.start();
+  harness.targetWindow.PIXI = { Renderer: Second };
+  harness.runIntervals(1000);
+  const renderer = createRenderer();
+  renderer.screen = { width: 1136, height: 640 };
+  Second.prototype.render.call(renderer, {});
+  harness.runTimeouts(0);
+  assert.equal(renderer.resolution, 2);
+  assert.equal(runtime.info().source, "pixi");
+});
+
+test("同一タスク内のRenderer捕捉をまとめて最後のRendererへ一度だけ適用する", () => {
+  const harness = createWindowHarness();
+  class Renderer { render() {} }
+  harness.targetWindow.PIXI = { Renderer };
+  createUpscalerRuntime(harness.targetWindow, {}).start();
+  const first = createRenderer();
+  const second = createRenderer();
+  first.screen = second.screen = { width: 1136, height: 640 };
+  Renderer.prototype.render.call(first, {});
+  Renderer.prototype.render.call(second, {});
+  harness.runTimeouts(0);
+  assert.equal(first.resizeCalls, 0);
+  assert.equal(second.resizeCalls, 1);
+  assert.equal(harness.resizeObservers.length, 1);
+  assert.equal(harness.resizeObservers[0].observed, second.view);
+});
+
+test("ezg側のRendererへ切り替わったら別RendererのPIXIシーンは使わない", () => {
+  const harness = createWindowHarness();
+  class Renderer { render() {} }
+  harness.targetWindow.PIXI = { Renderer };
+  const runtime = createUpscalerRuntime(harness.targetWindow, {});
+  runtime.start();
+  const renderer = createRenderer();
+  renderer.screen = { width: 1136, height: 640 };
+  const oldFilter = { resolution: 1 };
+  Renderer.prototype.render.call(renderer, { filters: [oldFilter] });
+  harness.runTimeouts(0);
+  oldFilter.resolution = 1;
+  const newRenderer = createRenderer();
+  harness.targetWindow.ezg = { game: { width: 1136, height: 640, renderer: newRenderer } };
+  harness.runTimeouts(0);
+  assert.equal(newRenderer.resolution, 2);
+  assert.equal(oldFilter.resolution, 1);
+  assert.equal(runtime.info().source, "ezg");
 });

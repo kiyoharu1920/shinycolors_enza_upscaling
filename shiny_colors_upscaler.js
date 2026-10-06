@@ -2,7 +2,7 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.6.2
+// @version      2.6.3
 // @description  Shiny ColorsのCanvasを高解像度化します。
 // @description:en Upscales the Canvas of Shiny Colors.
 // @license      MIT
@@ -195,9 +195,7 @@
     const parsed = Number(value);
     if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MODE;
 
-    return MANUAL_SCALES.reduce((nearest, candidate) =>
-      Math.abs(candidate - parsed) < Math.abs(nearest - parsed) ? candidate : nearest,
-    );
+    return nearestManualScale(parsed);
   }
 
   /**
@@ -211,8 +209,17 @@
     const parsed = Number(value);
     if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_FILTER_MODE;
 
+    return nearestManualScale(parsed);
+  }
+
+  /**
+   * 対応倍率のうち最も近い値を返す。同距離なら低い倍率を優先する。
+   * @param {number} value
+   * @returns {number}
+   */
+  function nearestManualScale(value) {
     return MANUAL_SCALES.reduce((nearest, candidate) =>
-      Math.abs(candidate - parsed) < Math.abs(nearest - parsed) ? candidate : nearest,
+      Math.abs(candidate - value) < Math.abs(nearest - value) ? candidate : nearest,
     );
   }
 
@@ -309,7 +316,7 @@
    */
   function clampScale(scale, gpuLimitScale) {
     const upper = Math.min(MAX_SCALE, Number.isFinite(gpuLimitScale) ? gpuLimitScale : MAX_SCALE);
-    return Math.max(MIN_SCALE, Math.min(scale, upper));
+    return Math.min(Math.max(MIN_SCALE, scale), upper > 0 ? upper : MIN_SCALE);
   }
 
   /**
@@ -382,7 +389,7 @@
 
     const logicalWidth = Number(game.width || renderer.screen?.width || renderer.width);
     const logicalHeight = Number(game.height || renderer.screen?.height || renderer.height);
-    if (!(logicalWidth > 0 && logicalHeight > 0)) return null;
+    if (![logicalWidth, logicalHeight].every((value) => Number.isFinite(value) && value > 0)) return null;
 
     const scale = resolveScale(renderer, logicalWidth, logicalHeight, mode, devicePixelRatio);
     const expectedWidth = Math.round(logicalWidth * scale);
@@ -412,8 +419,6 @@
         /** @type {ResolutionTarget} */ (target).resolution = scale;
       });
       renderer.resize(logicalWidth, logicalHeight);
-      renderer.view.style.width = cssWidth;
-      renderer.view.style.height = cssHeight;
       renderer.view.dataset.shinyColorsUpscaleMode = String(mode);
       renderer.view.dataset.shinyColorsUpscaleScale = String(scale);
 
@@ -429,13 +434,15 @@
       });
       try {
         renderer.resize(logicalWidth, logicalHeight);
-        renderer.view.style.width = cssWidth;
-        renderer.view.style.height = cssHeight;
       } catch (rollbackError) {
         console.error(`${LOG_PREFIX} 倍率適用後の復元にも失敗しました。`, rollbackError);
       }
-      console.warn(`${LOG_PREFIX} 倍率の適用に失敗しました。`, error);
+      console.warn(LOG_PREFIX + " 倍率の適用に失敗しました。", error);
       return null;
+    } finally {
+      // 復元用resizeまで失敗しても、画面レイアウトは必ず元に戻す。
+      renderer.view.style.width = cssWidth;
+      renderer.view.style.height = cssHeight;
     }
   }
 
@@ -521,7 +528,7 @@
   }
 
   /**
-   * Filter解像度設定を読む。未設定時はCanvas倍率への連動を使う。
+   * Filter解像度設定を読む。未設定時は既定の2xを使う。
    * @param {ShinyWindow} targetWindow
    * @param {((key: string, defaultValue: unknown) => unknown) | undefined} getValue
    * @returns {FilterMode}
@@ -748,14 +755,14 @@
 
   /**
    * 名前空間からrenderメソッドを持つprototypeを重複なく集める。
-   * 継承したrenderと、同じrender実装を共有するprototypeは除外する。
+   * 継承したrenderは除外し、同じprototypeへの別名参照だけを重複排除する。
    * @param {object[]} namespaces
    * @returns {Record<string, unknown>[]}
    */
   function collectRenderPrototypes(namespaces) {
     /** @type {Record<string, unknown>[]} */
     const prototypes = [];
-    const seenRenderFns = new Set();
+    const seenPrototypes = new Set();
 
     for (const namespace of namespaces) {
       for (const ctorName of RENDERER_CTOR_NAMES) {
@@ -773,8 +780,8 @@
         // 継承したrenderを包むと基底クラス側を二重に包むため、自前のものだけを対象にする。
         if (!Object.prototype.hasOwnProperty.call(prototype, "render")) continue;
         const renderFn = prototype.render;
-        if (typeof renderFn !== "function" || seenRenderFns.has(renderFn)) continue;
-        seenRenderFns.add(renderFn);
+        if (typeof renderFn !== "function" || seenPrototypes.has(prototype)) continue;
+        seenPrototypes.add(prototype);
         prototypes.push(prototype);
       }
     }
@@ -787,14 +794,15 @@
    * ezgを取得できない環境でも倍率を適用するための代替経路。
    * @param {ShinyWindow} targetWindow
    * @param {(renderer: PixiRenderer, stage: PixiDisplayObject | null) => void} onCapture
+   * @param {object[]=} namespaces 代入時に捕捉した名前空間。省略時はwindowを走査する。
    * @returns {boolean} フックを1つ以上設置できたか
    */
-  function installPixiRendererHook(targetWindow, onCapture) {
-    const prototypes = collectRenderPrototypes(findPixiNamespaces(targetWindow));
+  function installPixiRendererHook(targetWindow, onCapture, namespaces = findPixiNamespaces(targetWindow)) {
+    const prototypes = collectRenderPrototypes(namespaces);
     let installed = false;
 
     for (const prototype of prototypes) {
-      if (prototype[PIXI_HOOK_FLAG]) {
+      if (prototype[PIXI_HOOK_FLAG] === prototype.render) {
         installed = true;
         continue;
       }
@@ -826,7 +834,7 @@
         Object.defineProperty(prototype, PIXI_HOOK_FLAG, {
           configurable: true,
           enumerable: false,
-          value: true,
+          value: wrapped,
         });
         installed = true;
       } catch (error) {
@@ -835,6 +843,50 @@
     }
 
     return installed;
+  }
+
+  /**
+   * PIXIの各代入を捕捉する。短時間で別コピーへ上書きされても両方へフックを設置する。
+   * 他スクリプトのaccessorを維持し、再定義できない場合は定期走査へ任せる。
+   * @param {ShinyWindow} targetWindow
+   * @param {(namespace: object) => void} onAssigned
+   * @returns {boolean}
+   */
+  function installPixiAssignmentHook(targetWindow, onAssigned) {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(targetWindow, "PIXI");
+      const current = targetWindow.PIXI;
+      if (current && typeof current === "object") onAssigned(current);
+      if (descriptor?.configurable === false) return false;
+      const accessor = descriptor && !("value" in descriptor);
+      // 読み取り専用プロパティを代入可能に変えない。
+      if (descriptor && (accessor ? !descriptor.set : descriptor.writable === false)) return false;
+      let stored = current;
+      Object.defineProperty(targetWindow, "PIXI", {
+        configurable: true,
+        enumerable: descriptor?.enumerable ?? true,
+        get() {
+          return accessor ? descriptor.get?.call(this) : stored;
+        },
+        set(value) {
+          if (accessor) descriptor.set?.call(this, value);
+          else stored = value;
+          const namespace = accessor ? descriptor.get?.call(this) : stored;
+          if (namespace && typeof namespace === "object") {
+            // フック失敗をゲーム側の代入へ伝播させない。
+            try {
+              onAssigned(namespace);
+            } catch (error) {
+              console.warn(LOG_PREFIX + " PIXI代入の捕捉に失敗しました。", error);
+            }
+          }
+        },
+      });
+      return true;
+    } catch (error) {
+      console.warn(LOG_PREFIX + " PIXI代入フックを設定できませんでした。", error);
+      return false;
+    }
   }
 
   /**
@@ -850,7 +902,7 @@
     const height = Number(
       renderer.screen?.height ?? Number(renderer.height ?? renderer.view?.height) / resolution,
     );
-    if (!(width > 0 && height > 0)) return null;
+    if (![width, height].every((value) => Number.isFinite(value) && value > 0)) return null;
 
     return { width, height, renderer };
   }
@@ -865,7 +917,10 @@
    */
   function resolveGame(targetWindow, capturedEzg, fallbackGame = null) {
     const candidates = [targetWindow.ezg?.game, capturedEzg?.game, fallbackGame];
-    return candidates.find((candidate) => candidate?.renderer) ?? candidates.find(Boolean) ?? null;
+    return candidates.find((candidate) =>
+      candidate?.renderer?.view && candidate.renderer.view.isConnected !== false &&
+      typeof candidate.renderer.resize === "function",
+    ) ?? candidates.find((candidate) => candidate && !candidate.renderer) ?? null;
   }
 
   /**
@@ -878,8 +933,8 @@
    */
   function resolveStage(targetWindow, capturedEzg, game, fallbackStage = null) {
     return (
-      targetWindow.ezg?.sceneManager?.stage ??
-      capturedEzg?.sceneManager?.stage ??
+      (!game || targetWindow.ezg?.game === game ? targetWindow.ezg?.sceneManager?.stage : null) ??
+      (!game || capturedEzg?.game === game ? capturedEzg?.sceneManager?.stage : null) ??
       game?._sceneManager?.stage ??
       fallbackStage ??
       null
@@ -1006,6 +1061,10 @@
     let activeRenderer = null;
     /** 現在のCanvasサイズ監視。 @type {ResizeObserver | null} */
     let resizeObserver = null;
+    /** 現在ResizeObserverが監視するCanvas。 @type {CanvasView | null} */
+    let observedResizeView = null;
+    /** Renderer捕捉の連続通知を1つの適用へまとめるフラグ。 @type {boolean} */
+    let captureApplyPending = false;
     /** イベントを二重登録しないための監視済みCanvas集合。 @type {WeakSet<object>} */
     const observedViews = new WeakSet();
     /** 画面下部へ設定結果を表示する要素。 @type {HTMLDivElement | null} */
@@ -1016,6 +1075,9 @@
     let lastToastStatus = "";
     /** 同じruntimeの二重起動を防止するフラグ。 @type {boolean} */
     let started = false;
+
+    /** 現在有効なゲーム参照を取得する。 @returns {EzgGame | null} */
+    const currentGame = () => resolveGame(targetWindow, capturedEzg, createFallbackGame(capturedRenderer));
 
     /**
      * ホットキー変更結果や診断情報を画面下部へ一定時間表示する。
@@ -1049,10 +1111,14 @@
      * @returns {ApplyResult | null}
      */
     const apply = (force = false) => {
-      const game = resolveGame(targetWindow, capturedEzg, createFallbackGame(capturedRenderer));
-      if (!game?.renderer) return null;
-      activeRenderer = game.renderer;
-      const stage = resolveStage(targetWindow, capturedEzg, game, capturedStage);
+      const game = currentGame();
+      if (!game?.renderer) {
+        lastResult = null;
+        return null;
+      }
+      const stage = resolveStage(
+        targetWindow, capturedEzg, game, game.renderer === capturedRenderer ? capturedStage : null,
+      );
       lastResult = applyGameScale(
         game,
         stage,
@@ -1074,28 +1140,40 @@
 
     /**
      * Rendererの差し替えとCanvasイベント監視を更新する。
-     * @returns {void}
+     * @returns {boolean} Rendererが変わったか
      */
     const observeCurrentRenderer = () => {
-      const renderer = resolveGame(targetWindow, capturedEzg, createFallbackGame(capturedRenderer))
-        ?.renderer;
-      if (!renderer?.view) return;
+      const renderer = currentGame()?.renderer ?? null;
+      const changed = renderer !== activeRenderer;
+      activeRenderer = renderer;
+      const view = renderer?.view ?? null;
 
-      if (renderer !== activeRenderer) {
-        activeRenderer = renderer;
-        apply(true);
-      }
-
-      const viewObject = /** @type {object} */ (renderer.view);
-      if (observedViews.has(viewObject)) return;
-      observedViews.add(viewObject);
-      renderer.view.addEventListener?.("webglcontextrestored", () => apply(true));
-
-      if (typeof targetWindow.ResizeObserver === "function") {
+      // 一度監視したCanvasに戻っても、現在の監視先を再接続する。
+      if (view !== observedResizeView) {
         resizeObserver?.disconnect();
-        resizeObserver = new targetWindow.ResizeObserver(() => apply(false));
-        resizeObserver.observe(/** @type {Element} */ (/** @type {unknown} */ (renderer.view)));
+        resizeObserver = null;
+        observedResizeView = view;
+        if (view && typeof targetWindow.ResizeObserver === "function") {
+          resizeObserver = new targetWindow.ResizeObserver(() => apply(false));
+          resizeObserver.observe(/** @type {Element} */ (/** @type {unknown} */ (view)));
+        }
       }
+      if (view && !observedViews.has(view)) {
+        observedViews.add(view);
+        view.addEventListener?.("webglcontextrestored", () => apply(true));
+      }
+      return changed;
+    };
+
+    /** 描画中のresizeを避け、連続する捕捉通知を次のタスクで一度だけ適用する。 */
+    const scheduleCapturedApply = () => {
+      if (captureApplyPending) return;
+      captureApplyPending = true;
+      targetWindow.setTimeout(() => {
+        captureApplyPending = false;
+        observeCurrentRenderer();
+        apply(true);
+      }, 0);
     };
 
     /**
@@ -1108,13 +1186,8 @@
     const captureFromPixi = (renderer, stage) => {
       const changed = renderer !== capturedRenderer;
       capturedRenderer = renderer;
-      if (stage) capturedStage = stage;
-      if (!changed) return;
-      // 描画中のresizeを避け、次のタスクで適用する。
-      targetWindow.setTimeout(() => {
-        observeCurrentRenderer();
-        apply(true);
-      }, 0);
+      capturedStage = stage;
+      if (changed) scheduleCapturedApply();
     };
 
     /**
@@ -1124,7 +1197,7 @@
     const info = () => {
       const domCanvas = findDomCanvas(targetWindow);
       const ezgGame = targetWindow.ezg?.game ?? capturedEzg?.game ?? null;
-      const game = resolveGame(targetWindow, capturedEzg, createFallbackGame(capturedRenderer));
+      const game = currentGame();
       const renderer = game?.renderer;
       /** @type {RendererSource} */
       const source = !renderer ? "none" : ezgGame?.renderer === renderer ? "ezg" : "pixi";
@@ -1166,13 +1239,13 @@
       installEzgHook(targetWindow, (ezg) => {
         // ゲーム側はwindow.ezgを同期的にnull化するため、タイマーへ渡す前に参照を保持する。
         capturedEzg = ezg;
-        targetWindow.setTimeout(() => {
-          observeCurrentRenderer();
-          apply(true);
-        }, 0);
+        scheduleCapturedApply();
       });
       // ezgを取得できない環境（Stayのようにゲーム本体より後で実行される場合）の代替経路。
-      pixiHookInstalled = installPixiRendererHook(targetWindow, captureFromPixi);
+      installPixiAssignmentHook(targetWindow, (namespace) => {
+        pixiHookInstalled = installPixiRendererHook(targetWindow, captureFromPixi, [namespace]) || pixiHookInstalled;
+      });
+      pixiHookInstalled = installPixiRendererHook(targetWindow, captureFromPixi) || pixiHookInstalled;
 
       targetWindow.addEventListener("resize", () => targetWindow.setTimeout(() => apply(false), 250));
       targetWindow.addEventListener("orientationchange", () => targetWindow.setTimeout(() => apply(true), 400));
@@ -1199,10 +1272,10 @@
         true,
       );
       targetWindow.setInterval(() => {
-        // PIXIの読み込みが後の環境向けに、設置できるまでフックを試し続ける。
-        if (!pixiHookInstalled) pixiHookInstalled = installPixiRendererHook(targetWindow, captureFromPixi);
-        observeCurrentRenderer();
-        apply(false);
+        // 別名の追加、コンストラクタの後付け、renderの再定義も継続して追跡する。
+        pixiHookInstalled = installPixiRendererHook(targetWindow, captureFromPixi) || pixiHookInstalled;
+        const changed = observeCurrentRenderer();
+        apply(changed);
       }, 1000);
 
       targetWindow.__shinyColorsUpscaler = {
@@ -1277,6 +1350,7 @@
       getGpuScaleLimit,
       // isFilterHotkey,
       installEzgHook,
+      installPixiAssignmentHook,
       installPixiRendererHook,
       isUpscalerHotkey,
       // nextFilterMode,
