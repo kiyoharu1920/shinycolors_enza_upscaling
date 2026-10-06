@@ -2,7 +2,7 @@
 // @name         シャニマス Canvas 高解像度化
 // @name:en      Shiny Colors Canvas Upscaler
 // @namespace    local.kiyoh.shinycolors
-// @version      2.6.1
+// @version      2.6.2
 // @description  Shiny ColorsのCanvasを高解像度化します。
 // @description:en Upscales the Canvas of Shiny Colors.
 // @license      MIT
@@ -13,6 +13,8 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @noframes
+// @downloadURL https://update.greasyfork.org/scripts/590709/%E3%82%B7%E3%83%A3%E3%83%8B%E3%83%9E%E3%82%B9%20Canvas%20%E9%AB%98%E8%A7%A3%E5%83%8F%E5%BA%A6%E5%8C%96.user.js
+// @updateURL https://update.greasyfork.org/scripts/590709/%E3%82%B7%E3%83%A3%E3%83%8B%E3%83%9E%E3%82%B9%20Canvas%20%E9%AB%98%E8%A7%A3%E5%83%8F%E5%BA%A6%E5%8C%96.meta.js
 // ==/UserScript==
 
 // @ts-check
@@ -160,7 +162,7 @@
   const DEFAULT_MODE = 2;
   /** Filter解像度の既定値。 @type {FilterMode} */
   const DEFAULT_FILTER_MODE = 2;
-  /** 画面左下トーストを表示し続けるミリ秒。診断情報を読み切れる長さにする。 @type {number} */
+  /** トーストを表示し続けるミリ秒。診断情報を読み切れる長さにする。 @type {number} */
   const TOAST_DURATION_MS = 3000;
   /** PIXI名前空間から探すRendererコンストラクタ名。 @type {readonly string[]} */
   const RENDERER_CTOR_NAMES = Object.freeze([
@@ -957,11 +959,25 @@
 
     registerMenuCommand("現在の設定を再適用", () => {
       const result = runtime.apply(true);
-      showToast(result ? `再適用しました: ${result.scale}x` : "Rendererを取得できませんでした");
+      showToast(formatScaleToast(runtime.info().mode, result));
     });
     registerMenuCommand("診断情報を表示", () => {
       showToast(formatDiagnostics(runtime.info()));
     });
+  }
+
+  /**
+   * 設定倍率と実際の描画結果をトースト用の文章へまとめる。
+   * @param {ScaleMode} mode
+   * @param {ApplyResult | null} result
+   * @returns {string}
+   */
+  function formatScaleToast(mode, result) {
+    const label = mode === "auto" ? "auto（画面に合わせる）" : `${mode}倍`;
+    const actual = result
+      ? `実際：${Number(result.scale.toFixed(3))}倍（${result.backingStore[0]} × ${result.backingStore[1]}px）`
+      : "描画倍率を適用できません（Renderer未取得・描画待ち・適用失敗）";
+    return `描画倍率：${label}\n${actual}`;
   }
 
   /**
@@ -992,15 +1008,17 @@
     let resizeObserver = null;
     /** イベントを二重登録しないための監視済みCanvas集合。 @type {WeakSet<object>} */
     const observedViews = new WeakSet();
-    /** 画面左下へ設定結果を表示する要素。 @type {HTMLDivElement | null} */
+    /** 画面下部へ設定結果を表示する要素。 @type {HTMLDivElement | null} */
     let toastElement = null;
     /** トースト非表示タイマーの識別子。 @type {number} */
     let toastTimer = 0;
+    /** 同じ状態の定期通知を抑制するための最後の表示内容。 @type {string} */
+    let lastToastStatus = "";
     /** 同じruntimeの二重起動を防止するフラグ。 @type {boolean} */
     let started = false;
 
     /**
-     * ホットキー変更結果や診断情報を画面左下へ一定時間表示する。
+     * ホットキー変更結果や診断情報を画面下部へ一定時間表示する。
      * @param {string} message
      * @returns {void}
      */
@@ -1008,10 +1026,13 @@
       if (!targetWindow.document.body) return;
       if (!toastElement) {
         toastElement = targetWindow.document.createElement("div");
+        toastElement.setAttribute("role", "status");
+        toastElement.setAttribute("aria-live", "polite");
         toastElement.style.cssText =
-          "position:fixed;left:8px;bottom:8px;z-index:2147483647;padding:6px 10px;" +
-          "background:rgba(0,0,0,.72);color:#fff;font:12px/1.4 sans-serif;" +
-          "border-radius:4px;pointer-events:none;transition:opacity .3s;white-space:pre-line;";
+          "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;padding:12px 18px;" +
+          "background:rgba(20,20,20,.9);color:#fff;font:14px/1.5 sans-serif;" +
+          "border-radius:8px;pointer-events:none;transition:opacity .3s;white-space:pre-line;" +
+          "text-align:center;max-width:90vw;box-sizing:border-box;";
         targetWindow.document.body.appendChild(toastElement);
       }
       toastElement.textContent = message;
@@ -1040,6 +1061,14 @@
         force,
         filterMode,
       );
+      // 初回適用・autoの実倍率変化も通知。同じ状態の定期適用では再表示しない。
+      if (targetWindow.document.body) {
+        const status = formatScaleToast(mode, lastResult);
+        if (status !== lastToastStatus) {
+          showToast(status);
+          lastToastStatus = status;
+        }
+      }
       return lastResult;
     };
 
@@ -1158,9 +1187,7 @@
           mode = nextMode(mode);
           writeMode(targetWindow, mode, api.GM_setValue);
           const result = apply(true);
-          const label = mode === "auto" ? "自動" : `${mode}x`;
-          const actual = mode === "auto" && result ? ` → ${result.scale}x` : "";
-          showToast(`Canvas描画倍率: ${label}${actual}`);
+          showToast(formatScaleToast(mode, result));
 
           // Filter解像度のホットキー切り替えは無効化中。
           // filterMode = nextFilterMode(filterMode);
@@ -1246,6 +1273,7 @@
       findDomCanvas,
       findPixiNamespaces,
       formatDiagnostics,
+      formatScaleToast,
       getGpuScaleLimit,
       // isFilterHotkey,
       installEzgHook,
