@@ -19,3 +19,7 @@ npm-debug.log*
 # ログ・一時ファイル
 *.log
 *.tmp
+
+# ローカルのプロジェクトメモ
+/AGENT.md
+/CLAUDE.md
